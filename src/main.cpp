@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.6"
+#define FW_VERSION "1.0.7"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -173,7 +173,8 @@ long toEpoch(int Y,int M,int D,int h,int m,int s){
     if(M>2&&(Y%4==0&&(Y%100!=0||Y%400==0)))days++;
     return days*86400L+h*3600L+m*60L+s;
 }
-// Parse a "+CGNSSINFO: mode,gpsSV,gloSV,bdSV,lat,N/S,lon,E/W,ddmmyy,hhmmss.s,alt,spdKn,course,PDOP,HDOP,VDOP"
+// This A7670 firmware's format (decimal degrees, 4 SV-count fields):
+//  +CGNSSINFO: mode,gpsSV,gloSV,bdSV,galSV,lat,N/S,lon,E/W,ddmmyy,hhmmss.s,alt,speed,course,PDOP,HDOP,VDOP,...
 bool parseCGNSSINFO(const String &resp)
 {
     int i = resp.indexOf("+CGNSSINFO:");
@@ -181,23 +182,22 @@ bool parseCGNSSINFO(const String &resp)
     String s = resp.substring(i + 11);
     int e = s.indexOf('\n'); if (e >= 0) s = s.substring(0, e);
     s.trim();
-    String f[16]; int n = 0, start = 0;
-    for (int k = 0; k <= (int)s.length() && n < 16; k++)
+    String f[20]; int n = 0, start = 0;
+    for (int k = 0; k <= (int)s.length() && n < 20; k++)
         if (k == (int)s.length() || s[k] == ',') { f[n++] = s.substring(start, k); start = k + 1; }
-    if (n < 8 || f[0].length() == 0 || f[4].length() == 0) return false;   // no fix
-    double latRaw = atof(f[4].c_str()), lonRaw = atof(f[6].c_str());   // toDouble() returns 0 on ESP32
-    double la = (int)(latRaw / 100) + fmod(latRaw, 100.0) / 60.0;
-    double lo = (int)(lonRaw / 100) + fmod(lonRaw, 100.0) / 60.0;
-    if (f[5] == "S") la = -la;
-    if (f[7] == "W") lo = -lo;
+    if (n < 9 || f[0].length() == 0 || f[0] == "0" || f[5].length() == 0) return false;   // no fix
+    double la = atof(f[5].c_str());          // already decimal degrees (NOT ddmm)
+    double lo = atof(f[7].c_str());
+    if (f[6] == "S") la = -la;
+    if (f[8] == "W") lo = -lo;
     fix.lat = la; fix.lon = lo;
-    fix.sats = f[1].toInt() + f[2].toInt() + f[3].toInt();
-    if (f[8].length() >= 6) { fix.D = f[8].substring(0,2).toInt(); fix.Mo = f[8].substring(2,4).toInt(); fix.Y = 2000 + f[8].substring(4,6).toInt(); }
-    if (f[9].length() >= 6) { fix.h = f[9].substring(0,2).toInt(); fix.m = f[9].substring(2,4).toInt(); fix.s = f[9].substring(4,6).toInt(); }
-    if (n > 10) fix.alt     = f[10].toFloat();
-    if (n > 11) fix.speedKn = f[11].toFloat();
-    if (n > 12) fix.course  = f[12].toFloat();
-    if (n > 14) fix.hdop    = f[14].toFloat();
+    fix.sats = f[1].toInt() + f[2].toInt() + f[3].toInt() + f[4].toInt();
+    if (f[9].length()  >= 6) { fix.D = f[9].substring(0,2).toInt();  fix.Mo = f[9].substring(2,4).toInt();  fix.Y = 2000 + f[9].substring(4,6).toInt(); }
+    if (f[10].length() >= 6) { fix.h = f[10].substring(0,2).toInt(); fix.m  = f[10].substring(2,4).toInt(); fix.s = f[10].substring(4,6).toInt(); }
+    if (n > 11) fix.alt     = atof(f[11].c_str());
+    if (n > 12) fix.speedKn = atof(f[12].c_str());
+    if (n > 13) fix.course  = atof(f[13].c_str());
+    if (n > 15) fix.hdop    = atof(f[15].c_str());
     fix.valid = true; fix.ageMs = millis();
     return true;
 }
