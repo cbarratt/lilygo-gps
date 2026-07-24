@@ -20,7 +20,7 @@
 #include <TinyGPS++.h>
 #include "esp_sleep.h"
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -55,6 +55,7 @@ struct Config {
     uint16_t parkMin;        // PARK-mode report/sleep interval (min)
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
     bool     traccarEnabled;
+    bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
     // cellular (4G)
     String   apn, apnUser, apnPass, simPin;
     bool     cellEnabled;    // use 4G when WiFi is unavailable
@@ -75,6 +76,7 @@ void loadConfig()
     cfg.parkMin        = prefs.getUShort("pmin",  30);
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
+    cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
     cfg.apn            = prefs.getString("apn",   "mobile.sky");  // Sky Mobile (O2); TM=ThingsMobile, iot.1nce.net=1NCE
     cfg.apnUser        = prefs.getString("apnu",  "");
     cfg.apnPass        = prefs.getString("apnp",  "");
@@ -96,6 +98,7 @@ void saveConfig()
     prefs.putUShort("pmin",  cfg.parkMin);
     prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putBool("ten",     cfg.traccarEnabled);
+    prefs.putBool("dsleep",  cfg.deepSleep);
     prefs.putString("apn",   cfg.apn);
     prefs.putString("apnu",  cfg.apnUser);
     prefs.putString("apnp",  cfg.apnPass);
@@ -274,7 +277,7 @@ async function tick(){
    ['Uptime',s.up+' s']
   ];
   grid.innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v>${c[1]}</div></div>`).join('');
-  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   threshold '+s.pth+'mV   ·   4G '+(s.cell?'on':'off')+' APN '+s.apn;
+  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+' APN '+s.apn;
   if(s.fix){const p=[s.lat,s.lon];
    if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
    const t=await (await fetch('/api/track')).json();
@@ -331,6 +334,8 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <label>Park interval (minutes, on battery)</label><input type=number name=pmin value="%PMIN%" min=1>
 <label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
+<div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
+<div class=hint>Off = stay awake on battery (hotspot reachable, catches ignition within 5 s, uses more power). On = sleep between park reports to save battery.</div>
 <h2>FIRMWARE (OTA)</h2>
 <div class=hint>Running <b>v%FWVER%</b> · pulls the latest GitHub release over WiFi</div>
 <label>GitHub repo (owner/repo)</label><input type=text name=orepo value="%OREPO%">
@@ -376,6 +381,7 @@ void handleStatus() {
     j += ",\"fw\":\"" FW_VERSION "\",\"ota\":\"" + otaStatus + "\"";
     j += ",\"did\":\"" + cfg.deviceId + "\",\"thost\":\"" + cfg.traccarHost + "\",\"tport\":" + String(cfg.traccarPort);
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
+    j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
     server.send(200, "application/json", j);
@@ -427,6 +433,7 @@ void handleConfig() {
     p.replace("%PMIN%",  String(cfg.parkMin));
     p.replace("%PTH%",   String(cfg.powerThreshMv));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
+    p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
     p.replace("%APN%",   cfg.apn);   p.replace("%APNU%", cfg.apnUser); p.replace("%APNP%", cfg.apnPass);
     p.replace("%PIN%",   cfg.simPin);
     p.replace("%CELL%",  cfg.cellEnabled ? "checked" : "");
@@ -450,6 +457,7 @@ void handleSave() {
     if (server.hasArg("orepo"))  cfg.otaRepo  = server.arg("orepo");
     if (server.hasArg("oasset")) cfg.otaAsset = server.arg("oasset");
     cfg.traccarEnabled = server.hasArg("ten");
+    cfg.deepSleep      = server.hasArg("dsleep");
     cfg.cellEnabled    = server.hasArg("cell");
     saveConfig();
     server.send(200, "text/html",
@@ -613,20 +621,18 @@ void setup()
     bootModem();
     startGNSS();
 
-    if (!powerPresent) {
-        // PARK: bring up network, get one fix, report, then deep-sleep.
+    startNetwork();
+    if (!powerPresent && cfg.deepSleep) {
+        // PARK + deep-sleep: one fix, report, then sleep.
         modeStr = "PARK";
-        startNetwork();
-        Serial.println("PARK: acquiring fix...");
+        Serial.println("PARK: acquiring fix, report, then deep-sleep...");
         if (waitForFix(120000) && cfg.traccarEnabled) { pushTrack(gps.location.lat(), gps.location.lng()); report(); }
         else Serial.println("PARK: no fix within window");
         enterParkSleep();               // does not return
     }
-
-    // TRIP: stay awake, serve web UI, report on interval.
-    modeStr = "TRIP";
-    startNetwork();
-    Serial.println("TRIP: awake, reporting on interval");
+    // Otherwise stay awake (TRIP, or PARK with deep-sleep disabled) and serve the web UI.
+    modeStr = powerPresent ? "TRIP" : "PARK";
+    Serial.printf("%s: awake, reporting on interval (deep-sleep %s)\n", modeStr, cfg.deepSleep ? "on" : "off");
 }
 
 void loop()
@@ -642,19 +648,23 @@ void loop()
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
         updatePower();
-        if (!powerPresent) {
+        if (powerPresent) { modeStr = "TRIP"; powerLostSince = 0; }
+        else {
             if (!powerLostSince) powerLostSince = millis();
-            // debounce: only drop to PARK after 60s without power (ignore cranking dips)
-            if (millis() - powerLostSince > 60000) {
-                Serial.println("Power lost >60s -> entering PARK");
+            // only deep-sleep if enabled, and after 60s without power (ignore cranking dips)
+            if (cfg.deepSleep && millis() - powerLostSince > 60000) {
+                Serial.println("Power lost >60s -> PARK deep-sleep");
                 if (haveFix() && cfg.traccarEnabled) report();
-                enterParkSleep();
+                enterParkSleep();          // does not return
             }
-        } else powerLostSince = 0;
+            modeStr = "PARK";              // awake PARK when deep-sleep is off
+        }
     }
 
     if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(gps.location.lat(), gps.location.lng()); }
-    if (haveFix() && cfg.traccarEnabled && millis() - lastReport > (uint32_t)cfg.reportSec * 1000) { lastReport = millis(); report(); }
+    // TRIP reports every reportSec; PARK (awake) every parkMin
+    uint32_t interval = powerPresent ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
+    if (haveFix() && cfg.traccarEnabled && millis() - lastReport > interval) { lastReport = millis(); report(); }
     if (millis() - lastLog > 5000) {
         lastLog = millis();
         Serial.printf("[%s] batt:%umV pwr:%d wifi:%s sats:%d %s\n",
