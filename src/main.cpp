@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.5"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -201,9 +201,12 @@ bool parseCGNSSINFO(const String &resp)
     fix.valid = true; fix.ageMs = millis();
     return true;
 }
+String lastGnssRaw = "";
 void pollGnss()
 {
     String r = atCmd("AT+CGNSSINFO", 1500);
+    lastGnssRaw = r; lastGnssRaw.replace("\r", " "); lastGnssRaw.replace("\n", " ");
+    if (lastGnssRaw.length() > 110) lastGnssRaw = lastGnssRaw.substring(0, 110);
     if (r.indexOf("+CGNSSINFO:") < 0) return;      // no reply this cycle; existing fix ages out
     if (!parseCGNSSINFO(r)) fix.valid = false;     // got a reply but no fix
 }
@@ -428,6 +431,7 @@ void handleStatus() {
     j += ",\"postAgo\":" + String(lastPostMs ? (int)((millis() - lastPostMs) / 1000) : -1);
     j += ",\"okCount\":" + String(rtcPostOk) + ",\"failCount\":" + String(rtcPostFail);
     j += ",\"fw\":\"" FW_VERSION "\",\"ota\":\"" + otaStatus + "\"";
+    j += ",\"graw\":\"" + lastGnssRaw + "\"";
     j += ",\"did\":\"" + cfg.deviceId + "\",\"thost\":\"" + cfg.traccarHost + "\",\"tport\":" + String(cfg.traccarPort);
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
