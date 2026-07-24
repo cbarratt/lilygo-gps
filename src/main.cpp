@@ -20,7 +20,7 @@
 #include <TinyGPS++.h>
 #include "esp_sleep.h"
 
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.0.3"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -59,6 +59,7 @@ struct Config {
     // cellular (4G)
     String   apn, apnUser, apnPass, simPin;
     bool     cellEnabled;    // use 4G when WiFi is unavailable
+    bool     preferCell;     // prefer 4G even when WiFi STA is connected
     // OTA
     String   otaRepo, otaAsset;   // GitHub owner/repo + asset filename
 } cfg;
@@ -82,6 +83,7 @@ void loadConfig()
     cfg.apnPass        = prefs.getString("apnp",  "");
     cfg.simPin         = prefs.getString("pin",   "");     // blank = no PIN
     cfg.cellEnabled    = prefs.getBool("cell",    true);
+    cfg.preferCell     = prefs.getBool("pcell",   false);
     cfg.otaRepo        = prefs.getString("orepo", "");             // e.g. "callum/ttgo-tracker"
     cfg.otaAsset       = prefs.getString("oasset","firmware.bin");
     prefs.end();
@@ -104,6 +106,7 @@ void saveConfig()
     prefs.putString("apnp",  cfg.apnPass);
     prefs.putString("pin",   cfg.simPin);
     prefs.putBool("cell",    cfg.cellEnabled);
+    prefs.putBool("pcell",   cfg.preferCell);
     prefs.putString("orepo", cfg.otaRepo);
     prefs.putString("oasset",cfg.otaAsset);
     prefs.end();
@@ -277,7 +280,7 @@ async function tick(){
    ['Uptime',s.up+' s']
   ];
   grid.innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v>${c[1]}</div></div>`).join('');
-  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+' APN '+s.apn;
+  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn;
   if(s.fix){const p=[s.lat,s.lon];
    if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
    const t=await (await fetch('/api/track')).json();
@@ -324,6 +327,7 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <label>Device ID</label><input type=text name=did value="%DID%">
 <h2>CELLULAR (4G)</h2>
 <div class=row><input type=checkbox name=cell %CELL% id=cell><label for=cell style=margin:0>Use 4G when WiFi unavailable</label></div>
+<div class=row><input type=checkbox name=pcell %PCELL% id=pcell><label for=pcell style=margin:0>Prefer 4G even when WiFi is connected</label></div>
 <label>APN</label><input type=text name=apn value="%APN%">
 <div class=hint>Sky Mobile = <b>mobile.sky</b> · Things Mobile = <b>TM</b> · 1NCE = <b>iot.1nce.net</b></div>
 <label>APN username (usually blank)</label><input type=text name=apnu value="%APNU%">
@@ -382,6 +386,7 @@ void handleStatus() {
     j += ",\"did\":\"" + cfg.deviceId + "\",\"thost\":\"" + cfg.traccarHost + "\",\"tport\":" + String(cfg.traccarPort);
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
+    j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
     server.send(200, "application/json", j);
@@ -437,6 +442,7 @@ void handleConfig() {
     p.replace("%APN%",   cfg.apn);   p.replace("%APNU%", cfg.apnUser); p.replace("%APNP%", cfg.apnPass);
     p.replace("%PIN%",   cfg.simPin);
     p.replace("%CELL%",  cfg.cellEnabled ? "checked" : "");
+    p.replace("%PCELL%", cfg.preferCell ? "checked" : "");
     p.replace("%FWVER%", FW_VERSION);
     p.replace("%OREPO%", cfg.otaRepo); p.replace("%OASSET%", cfg.otaAsset);
     server.send(200, "text/html", p);
@@ -459,6 +465,7 @@ void handleSave() {
     cfg.traccarEnabled = server.hasArg("ten");
     cfg.deepSleep      = server.hasArg("dsleep");
     cfg.cellEnabled    = server.hasArg("cell");
+    cfg.preferCell     = server.hasArg("pcell");
     saveConfig();
     server.send(200, "text/html",
         "<meta http-equiv=refresh content='4;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>Saved. Rebooting… <a style=color:#58a6ff href='/'>back</a></body>");
@@ -578,8 +585,10 @@ String reportCellular()
 void report()
 {
     if (!haveFix()) return;
-    if (!apMode && WiFi.status() == WL_CONNECTED) reportWiFi();    // WiFi preferred (cheap)
-    else if (cfg.cellEnabled)                     reportCellular();// fall back to 4G
+    bool wifiUp = !apMode && WiFi.status() == WL_CONNECTED;
+    if (cfg.preferCell && cfg.cellEnabled) reportCellular();       // force 4G even on WiFi
+    else if (wifiUp)                       reportWiFi();           // WiFi preferred (cheap)
+    else if (cfg.cellEnabled)              reportCellular();       // fall back to 4G
 }
 
 // wait up to timeoutMs for a fresh fix, feeding the NMEA parser
