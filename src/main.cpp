@@ -17,10 +17,10 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
-#include <TinyGPS++.h>
 #include "esp_sleep.h"
+#include <math.h>
 
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.4"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -42,9 +42,18 @@
 #define BOARD_BAT_ADC_PIN 35     // battery voltage divider (V1.2/R2)
 
 HardwareSerial SerialAT(1);
-TinyGPSPlus    gps;
 WebServer      server(80);
 Preferences    prefs;
+
+// Position polled from the modem via AT+CGNSSINFO (no NMEA streaming).
+struct GnssFix {
+    bool     valid = false;
+    double   lat = 0, lon = 0;
+    float    alt = 0, speedKn = 0, course = 0, hdop = 0;
+    int      sats = 0;
+    int      Y = 0, Mo = 0, D = 0, h = 0, m = 0, s = 0;
+    uint32_t ageMs = 0;      // millis() at last valid update
+} fix;
 
 // ---- persisted config ----
 struct Config {
@@ -152,7 +161,10 @@ String atCmd(const char *cmd, uint32_t wait)
     while (SerialAT.available()) SerialAT.read();
     SerialAT.print(cmd); SerialAT.print("\r\n");
     String r; uint32_t end = millis() + wait;
-    while (millis() < end) while (SerialAT.available()) r += (char)SerialAT.read();
+    while (millis() < end) {
+        while (SerialAT.available()) r += (char)SerialAT.read();
+        if (r.indexOf("\r\nOK\r\n") >= 0 || r.indexOf("\r\nERROR") >= 0 || r.indexOf("+CME ERROR") >= 0) break;
+    }
     r.trim(); return r;
 }
 long toEpoch(int Y,int M,int D,int h,int m,int s){
@@ -161,7 +173,41 @@ long toEpoch(int Y,int M,int D,int h,int m,int s){
     if(M>2&&(Y%4==0&&(Y%100!=0||Y%400==0)))days++;
     return days*86400L+h*3600L+m*60L+s;
 }
-bool haveFix(){ return gps.location.isValid() && gps.location.age() < 5000; }
+// Parse a "+CGNSSINFO: mode,gpsSV,gloSV,bdSV,lat,N/S,lon,E/W,ddmmyy,hhmmss.s,alt,spdKn,course,PDOP,HDOP,VDOP"
+bool parseCGNSSINFO(const String &resp)
+{
+    int i = resp.indexOf("+CGNSSINFO:");
+    if (i < 0) return false;
+    String s = resp.substring(i + 11);
+    int e = s.indexOf('\n'); if (e >= 0) s = s.substring(0, e);
+    s.trim();
+    String f[16]; int n = 0, start = 0;
+    for (int k = 0; k <= (int)s.length() && n < 16; k++)
+        if (k == (int)s.length() || s[k] == ',') { f[n++] = s.substring(start, k); start = k + 1; }
+    if (n < 8 || f[0].length() == 0 || f[4].length() == 0) return false;   // no fix
+    double latRaw = f[4].toDouble(), lonRaw = f[6].toDouble();
+    double la = (int)(latRaw / 100) + fmod(latRaw, 100.0) / 60.0;
+    double lo = (int)(lonRaw / 100) + fmod(lonRaw, 100.0) / 60.0;
+    if (f[5] == "S") la = -la;
+    if (f[7] == "W") lo = -lo;
+    fix.lat = la; fix.lon = lo;
+    fix.sats = f[1].toInt() + f[2].toInt() + f[3].toInt();
+    if (f[8].length() >= 6) { fix.D = f[8].substring(0,2).toInt(); fix.Mo = f[8].substring(2,4).toInt(); fix.Y = 2000 + f[8].substring(4,6).toInt(); }
+    if (f[9].length() >= 6) { fix.h = f[9].substring(0,2).toInt(); fix.m = f[9].substring(2,4).toInt(); fix.s = f[9].substring(4,6).toInt(); }
+    if (n > 10) fix.alt     = f[10].toFloat();
+    if (n > 11) fix.speedKn = f[11].toFloat();
+    if (n > 12) fix.course  = f[12].toFloat();
+    if (n > 14) fix.hdop    = f[14].toFloat();
+    fix.valid = true; fix.ageMs = millis();
+    return true;
+}
+void pollGnss()
+{
+    String r = atCmd("AT+CGNSSINFO", 1500);
+    if (r.indexOf("+CGNSSINFO:") < 0) return;      // no reply this cycle; existing fix ages out
+    if (!parseCGNSSINFO(r)) fix.valid = false;     // got a reply but no fix
+}
+bool haveFix(){ return fix.valid && (millis() - fix.ageMs < 8000); }
 
 // forward declarations (plain .cpp has no auto-prototyping)
 String buildTraccarUrl();
@@ -355,16 +401,15 @@ void handleStatus() {
     String j = "{";
     j += "\"fix\":" + String(haveFix() ? "true" : "false");
     if (haveFix()) {
-        j += ",\"lat\":" + String(gps.location.lat(), 6);
-        j += ",\"lon\":" + String(gps.location.lng(), 6);
-        j += ",\"alt\":" + String(gps.altitude.isValid() ? gps.altitude.meters() : 0, 1);
-        j += ",\"kmh\":" + String(gps.speed.isValid() ? gps.speed.kmph() : 0, 1);
+        j += ",\"lat\":" + String(fix.lat, 6);
+        j += ",\"lon\":" + String(fix.lon, 6);
+        j += ",\"alt\":" + String(fix.alt, 1);
+        j += ",\"kmh\":" + String(fix.speedKn * 1.852, 1);
     }
-    j += ",\"sats\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0);
-    j += ",\"hdop\":" + String(gps.hdop.isValid() ? gps.hdop.hdop() : 0, 1);
+    j += ",\"sats\":" + String(fix.sats);
+    j += ",\"hdop\":" + String(fix.hdop, 1);
     char utc[16] = "";
-    if (gps.time.isValid() && gps.date.isValid())
-        snprintf(utc, sizeof(utc), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
+    if (haveFix()) snprintf(utc, sizeof(utc), "%02d:%02d:%02d", fix.h, fix.m, fix.s);
     j += ",\"utc\":\"" + String(utc) + "\"";
     j += ",\"battmv\":" + String(battMv);
     j += ",\"power\":" + String(powerPresent ? "true" : "false");
@@ -518,21 +563,20 @@ void startGNSS()
     atCmd("AT+CGNSSPWR=1", 3000);
     uint32_t end = millis() + 12000; String r;
     while (millis() < end) { while (SerialAT.available()) r += (char)SerialAT.read(); if (r.indexOf("READY") >= 0) break; }
-    atCmd("AT+CGNSSTST=1", 1000);
-    atCmd("AT+CGNSSPORTSWITCH=0,1", 1000);
+    // Position is polled on demand via AT+CGNSSINFO (no NMEA streaming) so the UART
+    // stays free for HTTP/status AT commands and the fix isn't torn down each report.
 }
 
 String buildTraccarUrl()
 {
     String url = "http://" + cfg.traccarHost + ":" + String(cfg.traccarPort) + "/?id=" + cfg.deviceId;
-    url += "&lat=" + String(gps.location.lat(), 6) + "&lon=" + String(gps.location.lng(), 6);
-    if (gps.date.isValid() && gps.time.isValid())
-        url += "&timestamp=" + String(toEpoch(gps.date.year(), gps.date.month(), gps.date.day(),
-                                               gps.time.hour(), gps.time.minute(), gps.time.second())) + "000";
-    if (gps.speed.isValid())    url += "&speed=" + String(gps.speed.knots(), 2);
-    if (gps.course.isValid())   url += "&bearing=" + String(gps.course.deg(), 1);
-    if (gps.altitude.isValid()) url += "&altitude=" + String(gps.altitude.meters(), 1);
-    if (gps.hdop.isValid())     url += "&hdop=" + String(gps.hdop.hdop(), 1);
+    url += "&lat=" + String(fix.lat, 6) + "&lon=" + String(fix.lon, 6);
+    if (fix.Y > 0)
+        url += "&timestamp=" + String(toEpoch(fix.Y, fix.Mo, fix.D, fix.h, fix.m, fix.s)) + "000";
+    url += "&speed=" + String(fix.speedKn, 2);
+    url += "&bearing=" + String(fix.course, 1);
+    url += "&altitude=" + String(fix.alt, 1);
+    url += "&hdop=" + String(fix.hdop, 1);
     url += "&batt=" + String(battMv);
     return url;
 }
@@ -549,7 +593,6 @@ void reportWiFi()
 // the duration so the HTTP URC isn't lost amid $Gx sentences. Returns a diag string.
 String reportCellular()
 {
-    atCmd("AT+CGNSSTST=0", 500);                                   // pause NMEA stream
     String diag;
     diag += "cgdcont[" + atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000) + "]";
     diag += " cgact[" + atCmd("AT+CGACT=1,1", 6000) + "]";
@@ -573,9 +616,6 @@ String reportCellular()
                   if (c1 > 0 && c2 > c1) code = seg.substring(c1 + 1, c2).toInt(); }
     atCmd("AT+HTTPTERM", 800);
     recordPost(code, "4G");
-
-    atCmd("AT+CGNSSTST=1", 500);                                   // resume NMEA stream
-    atCmd("AT+CGNSSPORTSWITCH=0,1", 500);
     diag += " action-urc[" + urc + "] code=" + String(code);
     diag.replace("\r", " "); diag.replace("\n", " ");
     Serial.printf(">> Traccar (4G) %s\n", diag.c_str());
@@ -596,10 +636,10 @@ bool waitForFix(uint32_t timeoutMs)
 {
     uint32_t end = millis() + timeoutMs;
     while (millis() < end) {
-        while (SerialAT.available()) gps.encode(SerialAT.read());
+        pollGnss();
         if (haveFix()) return true;
         server.handleClient();
-        delay(5);
+        delay(700);
     }
     return haveFix();
 }
@@ -635,7 +675,7 @@ void setup()
         // PARK + deep-sleep: one fix, report, then sleep.
         modeStr = "PARK";
         Serial.println("PARK: acquiring fix, report, then deep-sleep...");
-        if (waitForFix(120000) && cfg.traccarEnabled) { pushTrack(gps.location.lat(), gps.location.lng()); report(); }
+        if (waitForFix(120000) && cfg.traccarEnabled) { pushTrack(fix.lat, fix.lon); report(); }
         else Serial.println("PARK: no fix within window");
         enterParkSleep();               // does not return
     }
@@ -647,11 +687,11 @@ void setup()
 void loop()
 {
     server.handleClient();
-    while (SerialAT.available()) gps.encode(SerialAT.read());
 
-    static uint32_t lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0;
+    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0;
     static uint32_t powerLostSince = 0;
 
+    if (millis() - lastGnss > 2000) { lastGnss = millis(); pollGnss(); }
     if (millis() - lastCell > 20000) { lastCell = millis(); pollModemStatus(); }
 
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
@@ -670,7 +710,7 @@ void loop()
         }
     }
 
-    if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(gps.location.lat(), gps.location.lng()); }
+    if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); }
     // TRIP reports every reportSec; PARK (awake) every parkMin
     uint32_t interval = powerPresent ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
     if (haveFix() && cfg.traccarEnabled && millis() - lastReport > interval) { lastReport = millis(); report(); }
@@ -678,7 +718,6 @@ void loop()
         lastLog = millis();
         Serial.printf("[%s] batt:%umV pwr:%d wifi:%s sats:%d %s\n",
                       modeStr, battMv, powerPresent, apMode ? "AP" : "STA",
-                      gps.satellites.isValid() ? (int)gps.satellites.value() : 0,
-                      haveFix() ? "FIX" : "NO-FIX");
+                      fix.sats, haveFix() ? "FIX" : "NO-FIX");
     }
 }
