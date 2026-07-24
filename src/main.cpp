@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.8"
+#define FW_VERSION "1.0.9"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -248,42 +248,45 @@ static String afterKey(const String &s, const char *key)
 }
 // Query SIM + signal + registration. Shares the UART with the NMEA stream, so
 // responses arrive amid $Gx sentences — we substring-match the tokens we want.
-void pollModemStatus()
+// Staggered: one AT command per call (round-robin) so the web loop is never
+// blocked by 4 back-to-back modem queries. Called ~every 7.5s -> full refresh ~30s.
+void pollModemStatusStep()
 {
-    String r = atCmd("AT+CPIN?", 600);
-    if (r.indexOf("READY") >= 0)                              simStatus = "ready";
-    else if (r.indexOf("SIM PIN") >= 0)                       simStatus = "PIN required";
-    else if (r.indexOf("NOT INSERTED") >= 0 ||
-             r.indexOf("ERROR") >= 0)                         simStatus = "no SIM";
-    else if (r.indexOf("NOT READY") >= 0)                     simStatus = "not ready";
-    else if (r.length() == 0)                                 simStatus = "no response";
-    else                                                      simStatus = "unknown";
-
-    r = atCmd("AT+CSQ", 600);
-    String csq = afterKey(r, "+CSQ:");
-    int comma = csq.indexOf(',');
-    int val = (comma > 0) ? csq.substring(0, comma).toInt() : 99;
-    cellRssiDbm = (val == 99 || val == 0) ? 0 : (-113 + 2 * val);
-
-    r = atCmd("AT+CREG?", 600);
-    String creg = afterKey(r, "+CREG:");
-    // format: <n>,<stat>  -> stat 1=home, 5=roaming registered
-    int c2 = creg.indexOf(',');
-    int stat = (c2 >= 0) ? creg.substring(c2 + 1).toInt() : 0;
-    cellRegistered = (stat == 1 || stat == 5);
-
-    r = atCmd("AT+COPS?", 800);
-    int q1 = r.indexOf('"'); int q2 = (q1 >= 0) ? r.indexOf('"', q1 + 1) : -1;
-    cellOperator = (q1 >= 0 && q2 > q1) ? r.substring(q1 + 1, q2) : "";
-
-    pushSig(cellRssiDbm ? cellRssiDbm : -113);   // log signal (unknown -> floor)
+    static int step = 0;
+    if (step == 0) {
+        String r = atCmd("AT+CPIN?", 600);
+        if (r.indexOf("READY") >= 0)                              simStatus = "ready";
+        else if (r.indexOf("SIM PIN") >= 0)                       simStatus = "PIN required";
+        else if (r.indexOf("NOT INSERTED") >= 0 ||
+                 r.indexOf("ERROR") >= 0)                         simStatus = "no SIM";
+        else if (r.indexOf("NOT READY") >= 0)                     simStatus = "not ready";
+        else if (r.length() == 0)                                 simStatus = "no response";
+        else                                                      simStatus = "unknown";
+    } else if (step == 1) {
+        String r = atCmd("AT+CSQ", 600);
+        String csq = afterKey(r, "+CSQ:");
+        int comma = csq.indexOf(',');
+        int val = (comma > 0) ? csq.substring(0, comma).toInt() : 99;
+        cellRssiDbm = (val == 99 || val == 0) ? 0 : (-113 + 2 * val);
+        pushSig(cellRssiDbm ? cellRssiDbm : -113);   // one signal sample per cycle
+    } else if (step == 2) {
+        String r = atCmd("AT+CREG?", 600);
+        String creg = afterKey(r, "+CREG:");           // <n>,<stat>: 1=home, 5=roaming
+        int c2 = creg.indexOf(',');
+        int stat = (c2 >= 0) ? creg.substring(c2 + 1).toInt() : 0;
+        cellRegistered = (stat == 1 || stat == 5);
+    } else {
+        String r = atCmd("AT+COPS?", 800);
+        int q1 = r.indexOf('"'); int q2 = (q1 >= 0) ? r.indexOf('"', q1 + 1) : -1;
+        cellOperator = (q1 >= 0 && q2 > q1) ? r.substring(q1 + 1, q2) : "";
+    }
+    step = (step + 1) & 3;
 }
 
 // ================= web pages (status + config) =================
 const char PAGE_STATUS[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>TTGO GPS</title>
-<link rel=stylesheet href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
 :root{color-scheme:dark light}
 body{margin:0;font:15px/1.4 system-ui,sans-serif;background:#0e1116;color:#e6edf3}
@@ -302,11 +305,15 @@ a.btn{color:#58a6ff;text-decoration:none;border:1px solid #30363d;padding:6px 10
 <div id=map></div><div class=grid id=grid></div>
 <div style="padding:0 16px 8px"><div style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:6px">4G signal — last ~16 min</div><div id=sig></div></div>
 <div class=foot id=foot></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-let map,marker,line;
+let map,marker,line,mapReady=false,leafletLoading=false;
+function loadLeaflet(cb){
+ if(window.L){cb();return;} if(leafletLoading)return; leafletLoading=true;
+ const c=document.createElement('link');c.rel='stylesheet';c.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';document.head.appendChild(c);
+ const j=document.createElement('script');j.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';j.onload=cb;document.head.appendChild(j);
+}
 function initMap(){map=L.map('map').setView([0,0],2);
- L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);}
+ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);mapReady=true;}
 function fmt(n,d){return n==null?'–':Number(n).toFixed(d)}
 async function tick(){
  try{
@@ -333,9 +340,10 @@ async function tick(){
   grid.innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v>${c[1]}</div></div>`).join('');
   foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn+(s.awakeLeft>0?'   ·   ⏰ awake '+s.awakeLeft+'s':'');
   if(s.fix){const p=[s.lat,s.lon];
-   if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
-   const t=await (await fetch('/api/track')).json();
-   if(line)line.remove(); if(t.length>1)line=L.polyline(t,{color:'#58a6ff'}).addTo(map);}
+   if(!mapReady){loadLeaflet(()=>{if(!mapReady)initMap();marker=L.marker(p).addTo(map);map.setView(p,16);});}
+   else{if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
+    const t=await (await fetch('/api/track')).json();
+    if(line)line.remove(); if(t.length>1)line=L.polyline(t,{color:'#58a6ff'}).addTo(map);}}
  }catch(e){}
 }
 async function drawSig(){
@@ -349,7 +357,7 @@ async function drawSig(){
    +'<div style="font-size:12px;color:#8b949e;margin-top:4px">now <b>'+cur+'</b> dBm · min '+Math.min(...a)+' · max '+Math.max(...a)+'  <span style=color:#6e7681>(−50 strong … −113 none)</span></div>';
  }catch(e){}
 }
-initMap();tick();drawSig();setInterval(()=>{tick();drawSig();},2000);
+tick();drawSig();setInterval(()=>{tick();drawSig();},2000);
 </script></body></html>
 )HTML";
 
@@ -704,8 +712,8 @@ void loop()
     static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0;
     static uint32_t powerLostSince = 0;
 
-    if (millis() - lastGnss > 2000) { lastGnss = millis(); pollGnss(); }
-    if (millis() - lastCell > 20000) { lastCell = millis(); pollModemStatus(); }
+    if (millis() - lastGnss > 4000) { lastGnss = millis(); pollGnss(); }
+    if (millis() - lastCell > 7500) { lastCell = millis(); pollModemStatusStep(); }  // 1 cmd/pass, ~30s full cycle
 
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
