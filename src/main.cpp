@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "1.0.8"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -128,6 +128,8 @@ uint32_t  lastPostMs = 0;
 uint32_t  battMv = 0;
 bool      powerPresent = true;
 const char *modeStr = "BOOT";
+uint32_t  stayAwakeUntil = 0;      // while millis() < this, don't deep-sleep (button-wake window)
+bool      wokeByButton = false;
 // cellular status (refreshed by pollModemStatus)
 String    simStatus = "?";
 int       cellRssiDbm = 0;     // 0 = unknown
@@ -329,7 +331,7 @@ async function tick(){
    ['Uptime',s.up+' s']
   ];
   grid.innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v>${c[1]}</div></div>`).join('');
-  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn;
+  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn+(s.awakeLeft>0?'   ·   ⏰ awake '+s.awakeLeft+'s':'');
   if(s.fix){const p=[s.lat,s.lon];
    if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
    const t=await (await fetch('/api/track')).json();
@@ -436,6 +438,7 @@ void handleStatus() {
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
+    j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
     server.send(200, "application/json", j);
@@ -657,6 +660,7 @@ void enterParkSleep()
     atCmd("AT+CPOF", 2000);            // modem off (PWRKEY sequence re-boots it on wake)
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup((uint64_t)cfg.parkMin * 60ULL * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);   // BOOT button (active-low) also wakes it
     delay(50);
     esp_deep_sleep_start();            // wakes into setup() again
 }
@@ -665,6 +669,11 @@ void setup()
 {
     Serial.begin(115200); delay(300);
     Serial.println("\n===== TTGO GPS car tracker =====");
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        wokeByButton = true;
+        stayAwakeUntil = millis() + 5UL * 60UL * 1000UL;   // BOOT press -> stay awake 5 min
+        Serial.println("Woke via BOOT button -> staying awake 5 min for access");
+    }
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
     loadConfig();
     updatePower();
@@ -675,8 +684,8 @@ void setup()
     startGNSS();
 
     startNetwork();
-    if (!powerPresent && cfg.deepSleep) {
-        // PARK + deep-sleep: one fix, report, then sleep.
+    if (!powerPresent && cfg.deepSleep && !wokeByButton) {
+        // PARK + deep-sleep (timer wake): one fix, report, then sleep.
         modeStr = "PARK";
         Serial.println("PARK: acquiring fix, report, then deep-sleep...");
         if (waitForFix(120000) && cfg.traccarEnabled) { pushTrack(fix.lat, fix.lon); report(); }
@@ -704,8 +713,8 @@ void loop()
         if (powerPresent) { modeStr = "TRIP"; powerLostSince = 0; }
         else {
             if (!powerLostSince) powerLostSince = millis();
-            // only deep-sleep if enabled, and after 60s without power (ignore cranking dips)
-            if (cfg.deepSleep && millis() - powerLostSince > 60000) {
+            // only deep-sleep if enabled, past the button-wake window, and after 60s without power
+            if (cfg.deepSleep && millis() > stayAwakeUntil && millis() - powerLostSince > 60000) {
                 Serial.println("Power lost >60s -> PARK deep-sleep");
                 if (haveFix() && cfg.traccarEnabled) report();
                 enterParkSleep();          // does not return
