@@ -20,7 +20,7 @@
 #include <TinyGPS++.h>
 #include "esp_sleep.h"
 
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.2"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
