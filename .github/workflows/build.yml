@@ -1,0 +1,29 @@
+name: build-firmware
+
+# Tag a version (e.g. `git tag v1.0.1 && git push --tags`) to build firmware.bin
+# and attach it to a GitHub Release. The device's OTA pulls /releases/latest/download/firmware.bin
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build firmware
+        run: pio run -e ta7670g
+      - name: Stage binary
+        run: cp .pio/build/ta7670g/firmware.bin firmware.bin
+      - name: Create release with firmware.bin
+        uses: softprops/action-gh-release@v2
+        with:
+          files: firmware.bin
