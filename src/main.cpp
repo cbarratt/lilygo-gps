@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.5"
+#define FW_VERSION "1.0.6"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -185,7 +185,7 @@ bool parseCGNSSINFO(const String &resp)
     for (int k = 0; k <= (int)s.length() && n < 16; k++)
         if (k == (int)s.length() || s[k] == ',') { f[n++] = s.substring(start, k); start = k + 1; }
     if (n < 8 || f[0].length() == 0 || f[4].length() == 0) return false;   // no fix
-    double latRaw = f[4].toDouble(), lonRaw = f[6].toDouble();
+    double latRaw = atof(f[4].c_str()), lonRaw = atof(f[6].c_str());   // toDouble() returns 0 on ESP32
     double la = (int)(latRaw / 100) + fmod(latRaw, 100.0) / 60.0;
     double lo = (int)(lonRaw / 100) + fmod(lonRaw, 100.0) / 60.0;
     if (f[5] == "S") la = -la;
