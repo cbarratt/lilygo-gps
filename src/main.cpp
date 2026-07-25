@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -77,6 +77,9 @@ struct Config {
     bool     cellEnabled;    // use 4G when WiFi is unavailable
     bool     preferCell;     // prefer 4G even when WiFi STA is connected
     bool     agps;           // download A-GPS assist data over 4G for faster fixes
+    // heartbeat -> HA bridge (fires regardless of GPS fix)
+    bool     hbEnabled;
+    String   hbUrl;          // full URL to POST device status JSON to
     // OTA
     String   otaRepo, otaAsset;   // GitHub owner/repo + asset filename
 } cfg;
@@ -102,6 +105,8 @@ void loadConfig()
     cfg.cellEnabled    = prefs.getBool("cell",    true);
     cfg.preferCell     = prefs.getBool("pcell",   false);
     cfg.agps           = prefs.getBool("agps",    true);
+    cfg.hbEnabled      = prefs.getBool("hben",    false);
+    cfg.hbUrl          = prefs.getString("hburl", "");
     cfg.otaRepo        = prefs.getString("orepo", "");             // e.g. "callum/ttgo-tracker"
     cfg.otaAsset       = prefs.getString("oasset","firmware.bin");
     prefs.end();
@@ -126,6 +131,8 @@ void saveConfig()
     prefs.putBool("cell",    cfg.cellEnabled);
     prefs.putBool("pcell",   cfg.preferCell);
     prefs.putBool("agps",    cfg.agps);
+    prefs.putBool("hben",    cfg.hbEnabled);
+    prefs.putString("hburl", cfg.hbUrl);
     prefs.putString("orepo", cfg.otaRepo);
     prefs.putString("oasset",cfg.otaAsset);
     prefs.end();
@@ -146,6 +153,8 @@ int       cellRssiDbm = 0;     // 0 = unknown
 bool      cellRegistered = false;
 String    cellOperator = "";
 String    agpsStatus = "-";
+String    hbStatus = "-";      // last heartbeat result
+String    lastCmd = "-";       // last command received from the bridge
 // upload health + signal history
 String    lastVia = "-";
 uint32_t  lastOkMs = 0;
@@ -411,6 +420,10 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
 <div class=hint>Off = stay awake on battery (hotspot reachable, catches ignition within 5 s, uses more power). On = sleep between park reports to save battery.</div>
+<h2>HEARTBEAT (Home Assistant)</h2>
+<div class=row><input type=checkbox name=hben %HBEN% id=hben><label for=hben style=margin:0>Send status heartbeat (even without a fix)</label></div>
+<label>Heartbeat POST URL</label><input type=text name=hburl value="%HBURL%">
+<div class=hint>POSTs device-status JSON here every report tick (WiFi or 4G). Point at your HA bridge, e.g. http://home.barratt.me:5057/hb</div>
 <h2>FIRMWARE (OTA)</h2>
 <div class=hint>Running <b>v%FWVER%</b> · pulls the latest GitHub release over WiFi</div>
 <label>GitHub repo (owner/repo)</label><input type=text name=orepo value="%OREPO%">
@@ -459,6 +472,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
     j += ",\"agps\":" + String(cfg.agps ? "true" : "false") + ",\"agpsStatus\":\"" + agpsStatus + "\"";
+    j += ",\"hb\":" + String(cfg.hbEnabled ? "true" : "false") + ",\"hbStatus\":\"" + hbStatus + "\",\"lastCmd\":\"" + lastCmd + "\"";
     j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
@@ -520,6 +534,8 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%CELL%",  cfg.cellEnabled ? "checked" : "");
     p.replace("%PCELL%", cfg.preferCell ? "checked" : "");
     p.replace("%AGPS%",  cfg.agps ? "checked" : "");
+    p.replace("%HBEN%",  cfg.hbEnabled ? "checked" : "");
+    p.replace("%HBURL%", cfg.hbUrl);
     p.replace("%FWVER%", FW_VERSION);
     p.replace("%OREPO%", cfg.otaRepo); p.replace("%OASSET%", cfg.otaAsset);
     request->send(200, "text/html", p);
@@ -544,6 +560,8 @@ void handleSave(AsyncWebServerRequest *request) {
     cfg.cellEnabled    = request->hasArg("cell");
     cfg.preferCell     = request->hasArg("pcell");
     cfg.agps           = request->hasArg("agps");
+    cfg.hbEnabled      = request->hasArg("hben");
+    if (request->hasArg("hburl")) cfg.hbUrl = request->arg("hburl");
     saveConfig();
     request->send(200, "text/html",
         "<meta http-equiv=refresh content='4;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>Saved. Rebooting… <a style=color:#58a6ff href='/'>back</a></body>");
@@ -682,6 +700,91 @@ void report()
     else if (cfg.cellEnabled)              reportCellular();       // fall back to 4G
 }
 
+// POST a JSON body over 4G via the A7670 HTTP stack; returns the response body.
+String modemHttpPost(const String &url, const String &body)
+{
+    atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000);
+    atCmd("AT+CGACT=1,1", 6000);
+    atCmd("AT+HTTPTERM", 400);
+    atCmd("AT+HTTPINIT", 3000);
+    atCmd(("AT+HTTPPARA=\"URL\",\"" + url + "\"").c_str(), 1500);
+    atCmd("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 800);
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.print("AT+HTTPDATA=" + String(body.length()) + ",10000\r\n");   // announce body length
+    uint32_t e = millis() + 3000; String p;
+    while (millis() < e) { while (SerialAT.available()) p += (char)SerialAT.read(); if (p.indexOf("DOWNLOAD") >= 0) break; }
+    SerialAT.print(body);                                                    // send the body
+    e = millis() + 5000; while (millis() < e) { while (SerialAT.available()) p += (char)SerialAT.read(); if (p.indexOf("OK") >= 0) break; }
+    atCmd("AT+HTTPACTION=1", 2000);                                          // 1 = POST
+    String r; e = millis() + 30000; int code = 0, len = 0;
+    while (millis() < e) {
+        while (SerialAT.available()) r += (char)SerialAT.read();
+        int i = r.indexOf("+HTTPACTION:");
+        if (i >= 0) { String s = r.substring(i); int c1 = s.indexOf(','), c2 = s.indexOf(',', c1 + 1);
+                      if (c1 > 0 && c2 > c1) { code = s.substring(c1 + 1, c2).toInt(); len = s.substring(c2 + 1).toInt(); } break; }
+    }
+    hbStatus = "4G " + String(code);
+    String resp;
+    if (len > 0) {
+        String rr = atCmd(("AT+HTTPREAD=0," + String(len)).c_str(), 3000);
+        int i = rr.indexOf("+HTTPREAD:"); int nl = (i >= 0) ? rr.indexOf('\n', i) : -1;
+        if (nl >= 0) resp = rr.substring(nl + 1);
+    }
+    atCmd("AT+HTTPTERM", 800);
+    return resp;
+}
+
+String httpPost(const String &url, const String &body)
+{
+    bool wifiUp = !apMode && WiFi.status() == WL_CONNECTED;
+    if (cfg.preferCell && cfg.cellEnabled) return modemHttpPost(url, body);
+    if (wifiUp) {
+        HTTPClient http; http.begin(url);
+        http.addHeader("Content-Type", "application/json");
+        int code = http.POST(body);
+        String r = http.getString();
+        hbStatus = "WiFi " + String(code);
+        http.end();
+        return r;
+    }
+    if (cfg.cellEnabled) return modemHttpPost(url, body);
+    hbStatus = "no link";
+    return "";
+}
+
+// Bridge may reply with a queued command, e.g. {"cmd":"reboot"} -> executed here (poll-based control).
+void handleCommand(const String &resp)
+{
+    int i = resp.indexOf("\"cmd\"");
+    if (i < 0) return;
+    int cpos = resp.indexOf(':', i);
+    int q1 = (cpos >= 0) ? resp.indexOf('"', cpos) : -1;
+    int q2 = (q1 >= 0) ? resp.indexOf('"', q1 + 1) : -1;
+    if (q1 < 0 || q2 < 0) return;
+    String cmd = resp.substring(q1 + 1, q2);
+    if (cmd.length() == 0) return;
+    lastCmd = cmd;
+    Serial.printf("CMD from bridge: %s\n", cmd.c_str());
+    if      (cmd == "reboot") rebootAt = millis() + 800;
+    else if (cmd == "report") report();
+    else if (cmd == "test4g") test4gRequested = true;
+    else if (cmd == "agps")   refreshAGPS();
+}
+
+void heartbeat()
+{
+    if (!cfg.hbEnabled || cfg.hbUrl.length() == 0) return;
+    String b = "{\"id\":\"" + cfg.deviceId + "\",\"fw\":\"" FW_VERSION "\",\"up\":" + String(millis() / 1000);
+    b += ",\"fix\":" + String(haveFix() ? "true" : "false");
+    if (haveFix()) b += ",\"lat\":" + String(fix.lat, 6) + ",\"lon\":" + String(fix.lon, 6) + ",\"hdop\":" + String(fix.hdop, 1);
+    b += ",\"sats\":" + String(fix.sats) + ",\"batt\":" + String(battMv);
+    b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
+    b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false") + "}";
+    String resp = httpPost(cfg.hbUrl, b);
+    Serial.printf(">> heartbeat %s\n", hbStatus.c_str());
+    handleCommand(resp);
+}
+
 // wait up to timeoutMs for a fresh fix, feeding the NMEA parser
 bool waitForFix(uint32_t timeoutMs)
 {
@@ -774,7 +877,11 @@ void loop()
     if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); }
     // TRIP reports every reportSec; PARK (awake) every parkMin
     uint32_t interval = powerPresent ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
-    if (haveFix() && cfg.traccarEnabled && millis() - lastReport > interval) { lastReport = millis(); report(); }
+    if (millis() - lastReport > interval) {
+        lastReport = millis();
+        if (haveFix() && cfg.traccarEnabled) report();   // position -> Traccar (fix only)
+        heartbeat();                                     // status -> HA bridge (fix or not; no-op if off)
+    }
     if (millis() - lastLog > 5000) {
         lastLog = millis();
         Serial.printf("[%s] batt:%umV pwr:%d wifi:%s sats:%d %s\n",
