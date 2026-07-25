@@ -19,8 +19,9 @@
 #include <HTTPUpdate.h>
 #include "esp_sleep.h"
 #include <math.h>
+#include <sys/time.h>
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -69,6 +70,7 @@ struct Config {
     uint16_t traccarPort;
     uint16_t reportSec;      // TRIP-mode report interval (s)
     uint16_t parkMin;        // PARK-mode report/sleep interval (min)
+    uint16_t parkFixSec;     // PARK: max seconds to wait for a fresh fix before using cached
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
     bool     traccarEnabled;
     bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
@@ -94,7 +96,8 @@ void loadConfig()
     cfg.traccarPort    = prefs.getUShort("tport", 5055);
     cfg.deviceId       = prefs.getString("did",   "ttgo-a7670-01");
     cfg.reportSec      = prefs.getUShort("rsec",  10);
-    cfg.parkMin        = prefs.getUShort("pmin",  30);
+    cfg.parkMin        = prefs.getUShort("pmin",  45);
+    cfg.parkFixSec     = prefs.getUShort("pfix",  300);          // wait up to 5 min for a fix, else cached
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
     cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
@@ -121,6 +124,7 @@ void saveConfig()
     prefs.putString("did",   cfg.deviceId);
     prefs.putUShort("rsec",  cfg.reportSec);
     prefs.putUShort("pmin",  cfg.parkMin);
+    prefs.putUShort("pfix",  cfg.parkFixSec);
     prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putBool("ten",     cfg.traccarEnabled);
     prefs.putBool("dsleep",  cfg.deepSleep);
@@ -160,6 +164,14 @@ String    lastVia = "-";
 uint32_t  lastOkMs = 0;
 RTC_DATA_ATTR uint32_t rtcPostOk = 0;     // survive deep-sleep so park cycles accumulate
 RTC_DATA_ATTR uint32_t rtcPostFail = 0;
+// last good fix, cached across deep-sleep so a parked car can still report its known
+// position when a wake can't re-acquire satellites (garage / cold / poor sky view)
+RTC_DATA_ATTR double   rtcLat = 0, rtcLon = 0;
+RTC_DATA_ATTR float    rtcHdop = 0;
+RTC_DATA_ATTR int      rtcSats = 0;
+RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
+RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
+bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
 int       sigN = 0, sigHead = 0;
@@ -220,7 +232,7 @@ bool parseCGNSSINFO(const String &resp)
     if (n > 12) fix.speedKn = atof(f[12].c_str());
     if (n > 13) fix.course  = atof(f[13].c_str());
     if (n > 15) fix.hdop    = atof(f[15].c_str());
-    fix.valid = true; fix.ageMs = millis();
+    fix.valid = true; fix.ageMs = millis(); fixIsCached = false;
     return true;
 }
 String lastGnssRaw = "";
@@ -233,6 +245,33 @@ void pollGnss()
     if (!parseCGNSSINFO(r)) fix.valid = false;     // got a reply but no fix
 }
 bool haveFix(){ return fix.valid && (millis() - fix.ageMs < 8000); }
+
+// snapshot the current live fix into RTC so it survives deep sleep; also sync the
+// system clock from GPS UTC so we can measure the cached fix's age across wakes.
+void cacheFix(){
+    if (!fix.valid) return;
+    rtcLat = fix.lat; rtcLon = fix.lon; rtcHdop = fix.hdop; rtcSats = fix.sats; rtcFixValid = 1;
+    long e = toEpoch(fix.Y, fix.Mo, fix.D, fix.h, fix.m, fix.s);
+    if (e > 1600000000L){ rtcFixEpoch = e; struct timeval tv = { (time_t)e, 0 }; settimeofday(&tv, nullptr); }
+    fixIsCached = false;
+}
+// repopulate `fix` from the RTC cache (a parked car hasn't moved). Y=0 so the Traccar
+// URL omits the timestamp and the server stamps it "now" (i.e. still-here-now).
+bool loadCachedFix(){
+    if (!rtcFixValid) return false;
+    fix.lat = rtcLat; fix.lon = rtcLon; fix.hdop = rtcHdop; fix.sats = rtcSats;
+    fix.Y = fix.Mo = fix.D = fix.h = fix.m = fix.s = 0;
+    fix.valid = true; fix.ageMs = millis(); fixIsCached = true;
+    return true;
+}
+const char* fixSrcStr(){ return fixIsCached ? "cached" : (haveFix() ? "fresh" : "none"); }
+long fixAgeSec(){                                   // seconds since the reported coords were acquired
+    if (!rtcFixEpoch) return -1;
+    time_t now = time(nullptr);
+    if (now < 1600000000L) return -1;               // system clock not set yet
+    long a = (long)now - rtcFixEpoch;
+    return a < 0 ? -1 : a;
+}
 
 // forward declarations (plain .cpp has no auto-prototyping)
 String buildTraccarUrl();
@@ -416,6 +455,8 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <h2>REPORTING &amp; POWER</h2>
 <label>Trip interval (seconds, on power)</label><input type=number name=rsec value="%RSEC%" min=5>
 <label>Park interval (minutes, on battery)</label><input type=number name=pmin value="%PMIN%" min=1>
+<label>Park fix window (seconds)</label><input type=number name=pfix value="%PFIX%" min=30 max=600>
+<div class=hint>On each park wake, wait up to this long for a fresh GPS fix; if none, report the last known (cached) position instead. HA shows whether each report was "fresh" or "cached".</div>
 <label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
@@ -526,6 +567,7 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%DID%",   cfg.deviceId);
     p.replace("%RSEC%",  String(cfg.reportSec));
     p.replace("%PMIN%",  String(cfg.parkMin));
+    p.replace("%PFIX%",  String(cfg.parkFixSec));
     p.replace("%PTH%",   String(cfg.powerThreshMv));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
     p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
@@ -548,6 +590,7 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("did"))   cfg.deviceId    = request->arg("did");
     if (request->hasArg("rsec"))  cfg.reportSec   = max(5, (int)request->arg("rsec").toInt());
     if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
+    if (request->hasArg("pfix"))  cfg.parkFixSec  = constrain((int)request->arg("pfix").toInt(), 30, 600);
     if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
     if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
@@ -568,19 +611,31 @@ void handleSave(AsyncWebServerRequest *request) {
     rebootAt = millis() + 800;   // let the response flush, then loop() restarts
 }
 
+// Raise/drop the TTGO-GPS-Setup hotspot. It runs ONLY while STA is disconnected,
+// so there's no open AP broadcasting while parked at home. Acts on transitions only.
+void setAp(bool on)
+{
+    if (on == apMode) return;
+    if (on) { WiFi.mode(WIFI_AP_STA); WiFi.softAP("TTGO-GPS-Setup"); }
+    else    { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); }
+    apMode = on;
+    Serial.printf("AP %s\n", on ? "raised (home WiFi lost)" : "dropped (home WiFi back)");
+}
+
 void startNetwork()
 {
+    // STA-first: join home WiFi. The config hotspot is raised only if we can't
+    // connect (and, in loop, whenever STA later drops) and dropped again when
+    // home WiFi returns -- fixes the old bug where a lost STA never brought the AP
+    // back (power-cycle needed), without leaving an open AP up at home.
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
     uint32_t end = millis() + 15000;
     while (WiFi.status() != WL_CONNECTED && millis() < end) delay(300);
-    if (WiFi.status() == WL_CONNECTED) {
-        apMode = false;
-        Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        apMode = true; WiFi.mode(WIFI_AP); WiFi.softAP("TTGO-GPS-Setup");
-        Serial.printf("WiFi: AP mode %s\n", WiFi.softAPIP().toString().c_str());
-    }
+    if (WiFi.status() == WL_CONNECTED) Serial.printf("WiFi: STA %s\n", WiFi.localIP().toString().c_str());
+    else { setAp(true); Serial.printf("WiFi: STA down -> AP %s\n", WiFi.softAPIP().toString().c_str()); }
     if (MDNS.begin("ttgo-gps")) Serial.println("mDNS: http://ttgo-gps.local");
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send_P(200, "text/html", PAGE_STATUS); });
     server.on("/config", HTTP_GET, handleConfig);
@@ -778,6 +833,7 @@ void heartbeat()
     b += ",\"fix\":" + String(haveFix() ? "true" : "false");
     if (haveFix()) b += ",\"lat\":" + String(fix.lat, 6) + ",\"lon\":" + String(fix.lon, 6) + ",\"hdop\":" + String(fix.hdop, 1);
     b += ",\"sats\":" + String(fix.sats) + ",\"batt\":" + String(battMv);
+    b += ",\"fixsrc\":\"" + String(fixSrcStr()) + "\",\"fixage\":" + String(fixAgeSec());
     b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
     b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false") + "}";
     String resp = httpPost(cfg.hbUrl, b);
@@ -831,11 +887,20 @@ void setup()
 
     startNetwork();
     if (!powerPresent && cfg.deepSleep && !wokeByButton) {
-        // PARK + deep-sleep (timer wake): one fix, report, then sleep.
+        // PARK + deep-sleep (timer wake): register, A-GPS, try for a fresh fix; if none
+        // within the window, report the cached (parked) position. Feed Traccar AND the
+        // HA heartbeat (tagged fresh/cached) so we can see how the sleep is behaving.
         modeStr = "PARK";
-        Serial.println("PARK: acquiring fix, report, then deep-sleep...");
-        if (waitForFix(120000) && cfg.traccarEnabled) { pushTrack(fix.lat, fix.lon); report(); }
-        else Serial.println("PARK: no fix within window");
+        Serial.println("PARK: registering, A-GPS, then acquiring fix...");
+        uint32_t rend = millis() + 45000;                       // let modem register so A-GPS can download
+        while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+        if (cfg.agps) refreshAGPS();
+        bool got = waitForFix((uint32_t)cfg.parkFixSec * 1000UL);
+        if (got) { cacheFix(); Serial.println("PARK: fresh fix acquired"); }
+        else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> reporting cached position");
+        else Serial.println("PARK: no fix and no cached position");
+        if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
+        heartbeat();                    // status + fix source -> Home Assistant
         enterParkSleep();               // does not return
     }
     // Otherwise stay awake (TRIP, or PARK with deep-sleep disabled) and serve the web UI.
@@ -849,6 +914,24 @@ void loop()
     if (rebootAt && millis() > rebootAt) { delay(50); ESP.restart(); }
     if (test4gRequested) { test4gRequested = false; test4gResult = reportCellular(); }
     if (otaRequested)    { otaRequested = false; doOta(); }
+
+    // WiFi maintenance: raise the config hotspot only when home WiFi is lost
+    // (15s debounce so brief blips don't flap it) and drop it the instant STA
+    // reconnects -- so no open AP while parked at home.
+    static uint32_t lastWifi = 0, staDownSince = 0, lastRejoin = 0;
+    if (millis() - lastWifi > 5000) {
+        lastWifi = millis();
+        if (WiFi.status() == WL_CONNECTED) {
+            staDownSince = 0;
+            if (apMode) setAp(false);                        // home WiFi back -> drop hotspot
+        } else {
+            if (!staDownSince) staDownSince = millis();
+            if (!apMode && millis() - staDownSince > 15000) setAp(true);   // down >15s -> raise it
+            if (cfg.wifiSsid.length() && millis() - lastRejoin > 30000) {  // keep trying to rejoin home
+                lastRejoin = millis(); WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+            }
+        }
+    }
 
     static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0, lastAgps = 0;
     static uint32_t powerLostSince = 0;
@@ -874,7 +957,7 @@ void loop()
         }
     }
 
-    if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); }
+    if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); cacheFix(); }
     // TRIP reports every reportSec; PARK (awake) every parkMin
     uint32_t interval = powerPresent ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
     if (millis() - lastReport > interval) {
