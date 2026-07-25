@@ -65,6 +65,9 @@ def publish_discovery(did):
     cfg("sensor", "signal", {"name": "4G signal", "unit_of_measurement": "dBm", "icon": "mdi:signal"})
     cfg("sensor", "mode",   {"name": "Mode", "icon": "mdi:car"})
     cfg("sensor", "up",     {"name": "Uptime", "unit_of_measurement": "s", "icon": "mdi:timer"})
+    # was the last reported position a live GPS fix or the cached (parked) one, and how old
+    cfg("sensor", "fixsrc", {"name": "Fix source", "icon": "mdi:map-marker-check"})
+    cfg("sensor", "fixage", {"name": "Fix age", "unit_of_measurement": "s", "icon": "mdi:map-clock"})
     cfg("binary_sensor", "fix", {"name": "GPS fix", "payload_on": "True", "payload_off": "False",
                                  "device_class": "connectivity"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
