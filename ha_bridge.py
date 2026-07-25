@@ -110,7 +110,7 @@ class H(BaseHTTPRequestHandler):
                 {"latitude": d.get("lat"), "longitude": d.get("lon"), "gps_accuracy": d.get("hdop", 0)}), retain=True)
         # return a queued command, if any
         with lock:
-            q = cmd_queue.get(did) or []
+            q = cmd_queue.get(nid) or []          # keyed by topic-safe id (matches on_message)
             reply = {"cmd": q.pop(0)} if q else {"ok": 1}
         body = json.dumps(reply).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
