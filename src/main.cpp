@@ -11,7 +11,7 @@
  */
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.0.9"
+#define FW_VERSION "1.1.0"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -41,9 +41,16 @@
 #define MODEM_RX_PIN      27
 #define BOARD_BAT_ADC_PIN 35     // battery voltage divider (V1.2/R2)
 
-HardwareSerial SerialAT(1);
-WebServer      server(80);
-Preferences    prefs;
+HardwareSerial   SerialAT(1);
+AsyncWebServer   server(80);
+Preferences      prefs;
+
+// Deferred actions: async handlers must not block, so long work is flagged and
+// run from loop(). rebootAt lets the /save response flush before restarting.
+volatile bool otaRequested = false, test4gRequested = false;
+uint32_t      rebootAt = 0;
+String        test4gResult = "";
+void doOta();
 
 // Position polled from the modem via AT+CGNSSINFO (no NMEA streaming).
 struct GnssFix {
@@ -410,7 +417,7 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 </div></body></html>
 )HTML";
 
-void handleStatus() {
+void handleStatus(AsyncWebServerRequest *request) {
     String j = "{";
     j += "\"fix\":" + String(haveFix() ? "true" : "false");
     if (haveFix()) {
@@ -449,9 +456,9 @@ void handleStatus() {
     j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
-    server.send(200, "application/json", j);
+    request->send(200, "application/json", j);
 }
-void handleTrack() {
+void handleTrack(AsyncWebServerRequest *request) {
     String j = "[";
     for (int i = 0; i < trackN; i++) {
         int idx = (trackHead - trackN + i + TRACK_MAX) % TRACK_MAX;
@@ -459,16 +466,10 @@ void handleTrack() {
         j += "[" + String(track[idx].lat, 6) + "," + String(track[idx].lon, 6) + "]";
     }
     j += "]";
-    server.send(200, "application/json", j);
+    request->send(200, "application/json", j);
 }
-void handleOta() {
-    if (apMode || WiFi.status() != WL_CONNECTED) { server.send(200, "text/plain", "OTA needs WiFi (not available in AP or 4G mode)."); return; }
-    if (cfg.otaRepo.length() == 0) { server.send(200, "text/plain", "Set the GitHub repo (owner/repo) in config first."); return; }
+void doOta() {                                                    // runs in loop(), not the async handler
     String url = "https://github.com/" + cfg.otaRepo + "/releases/latest/download/" + cfg.otaAsset;
-    server.send(200, "text/html",
-        "<meta http-equiv=refresh content='60;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>"
-        "Updating from<br><code>" + url + "</code><br><br>Downloading &amp; flashing… device reboots if successful (~30–60 s), then this returns to the dashboard.</body>");
-    delay(200);
     otaStatus = "updating";
     WiFiClientSecure client; client.setInsecure();               // GitHub redirects to a signed host; skip cert pinning
     httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -478,18 +479,27 @@ void handleOta() {
     else if (ret == HTTP_UPDATE_NO_UPDATES) otaStatus = "no image found at URL";
     Serial.printf("OTA: %s\n", otaStatus.c_str());
 }
-void handleSig() {
+void handleOta(AsyncWebServerRequest *request) {
+    if (apMode || WiFi.status() != WL_CONNECTED) { request->send(200, "text/plain", "OTA needs WiFi (not available in AP or 4G mode)."); return; }
+    if (cfg.otaRepo.length() == 0) { request->send(200, "text/plain", "Set the GitHub repo (owner/repo) in config first."); return; }
+    String url = "https://github.com/" + cfg.otaRepo + "/releases/latest/download/" + cfg.otaAsset;
+    otaRequested = true;                                          // loop() performs the blocking update
+    request->send(200, "text/html",
+        "<meta http-equiv=refresh content='60;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>"
+        "Updating from<br><code>" + url + "</code><br><br>Downloading &amp; flashing… device reboots if successful (~30–60 s), then this returns to the dashboard.</body>");
+}
+void handleSig(AsyncWebServerRequest *request) {
     String j = "[";
     for (int i = 0; i < sigN; i++) { int idx = (sigHead - sigN + i + SIG_MAX) % SIG_MAX; if (i) j += ","; j += String(sigHist[idx]); }
     j += "]";
-    server.send(200, "application/json", j);
+    request->send(200, "application/json", j);
 }
-void handleTest4g() {
-    if (!haveFix()) { server.send(200, "text/plain", "No GPS fix yet - nothing to send."); return; }
-    String d = reportCellular();
-    server.send(200, "text/plain", "4G test -> " + d + "\n(HTTPACTION 200 = Traccar accepted)\nURL: " + buildTraccarUrl());
+void handleTest4g(AsyncWebServerRequest *request) {
+    if (!haveFix()) { request->send(200, "text/plain", "No GPS fix yet - nothing to send."); return; }
+    test4gRequested = true;                                       // loop() runs the (blocking) 4G post
+    request->send(200, "text/plain", "4G test queued - watch 'Last upload' on the dashboard (diag on serial).");
 }
-void handleConfig() {
+void handleConfig(AsyncWebServerRequest *request) {
     String p = FPSTR(PAGE_CONFIG);
     p.replace("%SSID%",  cfg.wifiSsid);   p.replace("%PASS%",  cfg.wifiPass);
     p.replace("%THOST%", cfg.traccarHost); p.replace("%TPORT%", String(cfg.traccarPort));
@@ -505,31 +515,31 @@ void handleConfig() {
     p.replace("%PCELL%", cfg.preferCell ? "checked" : "");
     p.replace("%FWVER%", FW_VERSION);
     p.replace("%OREPO%", cfg.otaRepo); p.replace("%OASSET%", cfg.otaAsset);
-    server.send(200, "text/html", p);
+    request->send(200, "text/html", p);
 }
-void handleSave() {
-    if (server.hasArg("ssid"))  cfg.wifiSsid    = server.arg("ssid");
-    if (server.hasArg("pass"))  cfg.wifiPass    = server.arg("pass");
-    if (server.hasArg("thost")) cfg.traccarHost = server.arg("thost");
-    if (server.hasArg("tport")) cfg.traccarPort = server.arg("tport").toInt();
-    if (server.hasArg("did"))   cfg.deviceId    = server.arg("did");
-    if (server.hasArg("rsec"))  cfg.reportSec   = max(5, (int)server.arg("rsec").toInt());
-    if (server.hasArg("pmin"))  cfg.parkMin     = max(1, (int)server.arg("pmin").toInt());
-    if (server.hasArg("pth"))   cfg.powerThreshMv = constrain((int)server.arg("pth").toInt(), 3000, 5000);
-    if (server.hasArg("apn"))   cfg.apn      = server.arg("apn");
-    if (server.hasArg("apnu"))  cfg.apnUser  = server.arg("apnu");
-    if (server.hasArg("apnp"))  cfg.apnPass  = server.arg("apnp");
-    if (server.hasArg("pin"))    cfg.simPin   = server.arg("pin");
-    if (server.hasArg("orepo"))  cfg.otaRepo  = server.arg("orepo");
-    if (server.hasArg("oasset")) cfg.otaAsset = server.arg("oasset");
-    cfg.traccarEnabled = server.hasArg("ten");
-    cfg.deepSleep      = server.hasArg("dsleep");
-    cfg.cellEnabled    = server.hasArg("cell");
-    cfg.preferCell     = server.hasArg("pcell");
+void handleSave(AsyncWebServerRequest *request) {
+    if (request->hasArg("ssid"))  cfg.wifiSsid    = request->arg("ssid");
+    if (request->hasArg("pass"))  cfg.wifiPass    = request->arg("pass");
+    if (request->hasArg("thost")) cfg.traccarHost = request->arg("thost");
+    if (request->hasArg("tport")) cfg.traccarPort = request->arg("tport").toInt();
+    if (request->hasArg("did"))   cfg.deviceId    = request->arg("did");
+    if (request->hasArg("rsec"))  cfg.reportSec   = max(5, (int)request->arg("rsec").toInt());
+    if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
+    if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
+    if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
+    if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
+    if (request->hasArg("apnp"))  cfg.apnPass  = request->arg("apnp");
+    if (request->hasArg("pin"))    cfg.simPin   = request->arg("pin");
+    if (request->hasArg("orepo"))  cfg.otaRepo  = request->arg("orepo");
+    if (request->hasArg("oasset")) cfg.otaAsset = request->arg("oasset");
+    cfg.traccarEnabled = request->hasArg("ten");
+    cfg.deepSleep      = request->hasArg("dsleep");
+    cfg.cellEnabled    = request->hasArg("cell");
+    cfg.preferCell     = request->hasArg("pcell");
     saveConfig();
-    server.send(200, "text/html",
+    request->send(200, "text/html",
         "<meta http-equiv=refresh content='4;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>Saved. Rebooting… <a style=color:#58a6ff href='/'>back</a></body>");
-    delay(600); ESP.restart();
+    rebootAt = millis() + 800;   // let the response flush, then loop() restarts
 }
 
 void startNetwork()
@@ -546,14 +556,14 @@ void startNetwork()
         Serial.printf("WiFi: AP mode %s\n", WiFi.softAPIP().toString().c_str());
     }
     if (MDNS.begin("ttgo-gps")) Serial.println("mDNS: http://ttgo-gps.local");
-    server.on("/", [](){ server.send_P(200, "text/html", PAGE_STATUS); });
-    server.on("/config", handleConfig);
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send_P(200, "text/html", PAGE_STATUS); });
+    server.on("/config", HTTP_GET, handleConfig);
     server.on("/save", HTTP_POST, handleSave);
-    server.on("/api/status", handleStatus);
-    server.on("/api/track", handleTrack);
-    server.on("/api/sig", handleSig);
-    server.on("/test4g", handleTest4g);
-    server.on("/ota", handleOta);
+    server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/track", HTTP_GET, handleTrack);
+    server.on("/api/sig", HTTP_GET, handleSig);
+    server.on("/test4g", HTTP_GET, handleTest4g);
+    server.on("/ota", HTTP_GET, handleOta);
     server.begin();
 }
 
@@ -653,7 +663,6 @@ bool waitForFix(uint32_t timeoutMs)
     while (millis() < end) {
         pollGnss();
         if (haveFix()) return true;
-        server.handleClient();
         delay(700);
     }
     return haveFix();
@@ -707,7 +716,10 @@ void setup()
 
 void loop()
 {
-    server.handleClient();
+    // async web server runs off-loop; here we just run the deferred (blocking) actions it queued
+    if (rebootAt && millis() > rebootAt) { delay(50); ESP.restart(); }
+    if (test4gRequested) { test4gRequested = false; test4gResult = reportCellular(); }
+    if (otaRequested)    { otaRequested = false; doOta(); }
 
     static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0;
     static uint32_t powerLostSince = 0;
