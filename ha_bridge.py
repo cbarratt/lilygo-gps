@@ -111,6 +111,9 @@ class H(BaseHTTPRequestHandler):
             last_seen[did] = time.time()
         mc.publish(f"tracker/{nid}/availability", "online", retain=True)
         mc.publish(f"tracker/{nid}/state", json.dumps(d), retain=True)
+        # "last reported" = wall-clock time we received this heartbeat (ISO8601 w/ tz)
+        mc.publish(f"tracker/{nid}/last_seen",
+                   datetime.now(timezone.utc).isoformat(), retain=True)
         if d.get("fix"):
             mc.publish(f"tracker/{nid}/attrs", json.dumps(
                 {"latitude": d.get("lat"), "longitude": d.get("lon"), "gps_accuracy": d.get("hdop", 0)}), retain=True)
