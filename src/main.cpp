@@ -666,12 +666,10 @@ void refreshAGPS()
     atCmd("AT+CGACT=1,1", 6000);                                  // ensure a data context for the download
     String u = atCmd("AT+CAGPS", 3000);                           // request assist data from the AGNSS server
     agpsStatus = (u.indexOf("ERROR") >= 0) ? "error" : "requested";
-    uint32_t end = millis() + 25000;                             // wait for the +CAGPS URC (download result)
-    while (millis() < end) { while (SerialAT.available()) u += (char)SerialAT.read(); if (u.indexOf("+CAGPS:") >= 0) break; }
-    if (u.indexOf("+CAGPS:") >= 0) {
-        String res = afterKey(u, "+CAGPS:");
-        agpsStatus = (res.indexOf("success") >= 0 || res.startsWith("1")) ? "ok" : ("resp:" + res);
-    }
+    uint32_t end = millis() + 40000;                             // wait for the "+AGPS: success." URC
+    while (millis() < end) { while (SerialAT.available()) u += (char)SerialAT.read(); if (u.indexOf("+AGPS:") >= 0) break; }
+    if (u.indexOf("+AGPS:") >= 0)
+        agpsStatus = (u.indexOf("success") >= 0) ? "ok" : ("resp:" + afterKey(u, "+AGPS:"));
     Serial.printf("AGPS: %s\n", agpsStatus.c_str());
 }
 
