@@ -1,0 +1,18 @@
+services:
+  ha-gps-bridge:
+    build: .
+    container_name: ha-gps-bridge
+    restart: unless-stopped
+    # host networking = binds :5057 directly on the host AND can reach a local
+    # Mosquitto on 127.0.0.1. If your broker is on another machine, delete this
+    # line, uncomment the "ports:" block, and set MQTT_HOST to the broker's IP.
+    network_mode: host
+    # ports:
+    #   - "5057:5057"
+    environment:
+      MQTT_HOST: "127.0.0.1"      # Mosquitto host (127.0.0.1 with host networking)
+      MQTT_PORT: "1883"
+      MQTT_USER: "CHANGEME"       # your Mosquitto username
+      MQTT_PASS: "CHANGEME"       # your Mosquitto password
+      HTTP_PORT: "5057"           # the port the device POSTs its heartbeat to
+      OFFLINE_AFTER: "300"        # secs without a heartbeat before HA shows it offline

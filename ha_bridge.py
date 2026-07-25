@@ -71,7 +71,10 @@ def publish_discovery(did):
         mc.publish(f"homeassistant/button/{nid}/{c}/config", json.dumps({
             "unique_id": f"{nid}_{c}", "device": dev, "name": c.capitalize(),
             "command_topic": f"tracker/{nid}/cmd", "payload_press": c}), retain=True)
-    mc.subscribe(f"tracker/{nid}/cmd")
+
+def on_connect(cl, ud, flags, rc):              # (re)subscribe to every device's cmd topic
+    print("MQTT connected rc=", rc)
+    cl.subscribe("tracker/+/cmd")
 
 def on_message(cl, ud, msg):                    # HA button press -> queue a command
     did = msg.topic.split("/")[1]
@@ -114,8 +117,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
 if __name__ == "__main__":
+    mc.on_connect = on_connect
     mc.on_message = on_message
-    mc.connect(MQTT_HOST, MQTT_PORT, 60)
+    mc.reconnect_delay_set(min_delay=1, max_delay=30)
+    mc.connect_async(MQTT_HOST, MQTT_PORT, 60)     # non-blocking; auto-reconnects if broker is down
     mc.loop_start()
     threading.Thread(target=offline_watch, daemon=True).start()
     print(f"HA bridge on :{HTTP_PORT}  ->  MQTT {MQTT_HOST}:{MQTT_PORT}")
