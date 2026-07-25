@@ -19,6 +19,7 @@ Point the device's /config Heartbeat URL at:  http://<this-host>:5057/hb
 (from 4G it must be internet-reachable, e.g. http://home.barratt.me:5057/hb)
 """
 import os, json, time, threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import paho.mqtt.client as mqtt
 
@@ -66,6 +67,11 @@ def publish_discovery(did):
     cfg("sensor", "up",     {"name": "Uptime", "unit_of_measurement": "s", "icon": "mdi:timer"})
     cfg("binary_sensor", "fix", {"name": "GPS fix", "payload_on": "True", "payload_off": "False",
                                  "device_class": "connectivity"})
+    # "last reported" = when the bridge last received a heartbeat (published from its own topic)
+    mc.publish(f"homeassistant/sensor/{nid}/last_seen/config", json.dumps({
+        "unique_id": f"{nid}_last_seen", "device": dev, "availability_topic": avail,
+        "name": "Last reported", "device_class": "timestamp",
+        "state_topic": f"tracker/{nid}/last_seen", "icon": "mdi:clock-check"}), retain=True)
     # command buttons -> publish to cmd topic
     for c in ("reboot", "report", "test4g"):
         mc.publish(f"homeassistant/button/{nid}/{c}/config", json.dumps({
