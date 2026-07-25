@@ -20,7 +20,7 @@
 #include "esp_sleep.h"
 #include <math.h>
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -76,6 +76,7 @@ struct Config {
     String   apn, apnUser, apnPass, simPin;
     bool     cellEnabled;    // use 4G when WiFi is unavailable
     bool     preferCell;     // prefer 4G even when WiFi STA is connected
+    bool     agps;           // download A-GPS assist data over 4G for faster fixes
     // OTA
     String   otaRepo, otaAsset;   // GitHub owner/repo + asset filename
 } cfg;
@@ -100,6 +101,7 @@ void loadConfig()
     cfg.simPin         = prefs.getString("pin",   "");     // blank = no PIN
     cfg.cellEnabled    = prefs.getBool("cell",    true);
     cfg.preferCell     = prefs.getBool("pcell",   false);
+    cfg.agps           = prefs.getBool("agps",    true);
     cfg.otaRepo        = prefs.getString("orepo", "");             // e.g. "callum/ttgo-tracker"
     cfg.otaAsset       = prefs.getString("oasset","firmware.bin");
     prefs.end();
@@ -123,6 +125,7 @@ void saveConfig()
     prefs.putString("pin",   cfg.simPin);
     prefs.putBool("cell",    cfg.cellEnabled);
     prefs.putBool("pcell",   cfg.preferCell);
+    prefs.putBool("agps",    cfg.agps);
     prefs.putString("orepo", cfg.otaRepo);
     prefs.putString("oasset",cfg.otaAsset);
     prefs.end();
@@ -142,6 +145,7 @@ String    simStatus = "?";
 int       cellRssiDbm = 0;     // 0 = unknown
 bool      cellRegistered = false;
 String    cellOperator = "";
+String    agpsStatus = "-";
 // upload health + signal history
 String    lastVia = "-";
 uint32_t  lastOkMs = 0;
@@ -345,7 +349,7 @@ async function tick(){
    ['Uptime',s.up+' s']
   ];
   grid.innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v>${c[1]}</div></div>`).join('');
-  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn+(s.awakeLeft>0?'   ·   ⏰ awake '+s.awakeLeft+'s':'');
+  foot.textContent='Device: '+s.did+'  →  '+s.thost+':'+s.tport+'   ·   trip '+s.rsec+'s / park '+s.pmin+'min   ·   deep-sleep '+(s.dsleep?'on':'off')+'   ·   4G '+(s.cell?'on':'off')+(s.pcell?' (preferred)':'')+' APN '+s.apn+(s.agps?'   ·   A-GPS '+s.agpsStatus:'')+(s.awakeLeft>0?'   ·   ⏰ awake '+s.awakeLeft+'s':'');
   if(s.fix){const p=[s.lat,s.lon];
    if(!mapReady){loadLeaflet(()=>{if(!mapReady)initMap();marker=L.marker(p).addTo(map);map.setView(p,16);});}
    else{if(!marker){marker=L.marker(p).addTo(map);map.setView(p,16);}else marker.setLatLng(p);
@@ -394,6 +398,7 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <h2>CELLULAR (4G)</h2>
 <div class=row><input type=checkbox name=cell %CELL% id=cell><label for=cell style=margin:0>Use 4G when WiFi unavailable</label></div>
 <div class=row><input type=checkbox name=pcell %PCELL% id=pcell><label for=pcell style=margin:0>Prefer 4G even when WiFi is connected</label></div>
+<div class=row><input type=checkbox name=agps %AGPS% id=agps><label for=agps style=margin:0>A-GPS (assist data over 4G for faster fixes)</label></div>
 <label>APN</label><input type=text name=apn value="%APN%">
 <div class=hint>Sky Mobile = <b>mobile.sky</b> · Things Mobile = <b>TM</b> · 1NCE = <b>iot.1nce.net</b></div>
 <label>APN username (usually blank)</label><input type=text name=apnu value="%APNU%">
@@ -453,6 +458,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
+    j += ",\"agps\":" + String(cfg.agps ? "true" : "false") + ",\"agpsStatus\":\"" + agpsStatus + "\"";
     j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
     j += "}";
@@ -513,6 +519,7 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%PIN%",   cfg.simPin);
     p.replace("%CELL%",  cfg.cellEnabled ? "checked" : "");
     p.replace("%PCELL%", cfg.preferCell ? "checked" : "");
+    p.replace("%AGPS%",  cfg.agps ? "checked" : "");
     p.replace("%FWVER%", FW_VERSION);
     p.replace("%OREPO%", cfg.otaRepo); p.replace("%OASSET%", cfg.otaAsset);
     request->send(200, "text/html", p);
@@ -536,6 +543,7 @@ void handleSave(AsyncWebServerRequest *request) {
     cfg.deepSleep      = request->hasArg("dsleep");
     cfg.cellEnabled    = request->hasArg("cell");
     cfg.preferCell     = request->hasArg("pcell");
+    cfg.agps           = request->hasArg("agps");
     saveConfig();
     request->send(200, "text/html",
         "<meta http-equiv=refresh content='4;url=/'><body style='font:16px system-ui;background:#0e1116;color:#e6edf3;padding:30px'>Saved. Rebooting… <a style=color:#58a6ff href='/'>back</a></body>");
@@ -647,6 +655,26 @@ String reportCellular()
     return diag;
 }
 
+// Download A-GPS assist data over the cellular link so cold fixes are fast and
+// weak-signal locking is far better (the trick phones use). Needs the modem
+// registered on the network. Infrequent (boot + periodic), so the ~25s block is fine.
+void refreshAGPS()
+{
+    if (!cfg.agps)       { agpsStatus = "off"; return; }
+    if (!cellRegistered) { agpsStatus = "no network"; return; }   // assist data comes over cellular
+    atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000);
+    atCmd("AT+CGACT=1,1", 6000);                                  // ensure a data context for the download
+    String u = atCmd("AT+CAGPS", 3000);                           // request assist data from the AGNSS server
+    agpsStatus = (u.indexOf("ERROR") >= 0) ? "error" : "requested";
+    uint32_t end = millis() + 25000;                             // wait for the +CAGPS URC (download result)
+    while (millis() < end) { while (SerialAT.available()) u += (char)SerialAT.read(); if (u.indexOf("+CAGPS:") >= 0) break; }
+    if (u.indexOf("+CAGPS:") >= 0) {
+        String res = afterKey(u, "+CAGPS:");
+        agpsStatus = (res.indexOf("success") >= 0 || res.startsWith("1")) ? "ok" : ("resp:" + res);
+    }
+    Serial.printf("AGPS: %s\n", agpsStatus.c_str());
+}
+
 void report()
 {
     if (!haveFix()) return;
@@ -721,11 +749,13 @@ void loop()
     if (test4gRequested) { test4gRequested = false; test4gResult = reportCellular(); }
     if (otaRequested)    { otaRequested = false; doOta(); }
 
-    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0;
+    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0, lastAgps = 0;
     static uint32_t powerLostSince = 0;
 
     if (millis() - lastGnss > 4000) { lastGnss = millis(); pollGnss(); }
     if (millis() - lastCell > 7500) { lastCell = millis(); pollModemStatusStep(); }  // 1 cmd/pass, ~30s full cycle
+    // A-GPS: refresh assist data once registered, then every ~2h (needs GNSS off during inject? no - runs alongside)
+    if (cfg.agps && cellRegistered && (lastAgps == 0 || millis() - lastAgps > 2UL * 3600 * 1000UL)) { lastAgps = millis(); refreshAGPS(); }
 
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
