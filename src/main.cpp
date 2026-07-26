@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.5.1"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -154,6 +154,8 @@ bool      powerPresent = true;
 const char *modeStr = "BOOT";
 uint32_t  stayAwakeUntil = 0;      // while millis() < this, don't deep-sleep (button-wake window)
 bool      wokeByButton = false;
+bool      stayAwake = false;       // remote "wake" cmd picked up during a park report -> don't re-sleep
+bool      modemBooted = false;     // true once bootModem() ran this boot (avoid a double PWRKEY pulse)
 // cellular status (refreshed by pollModemStatus)
 String    simStatus = "?";
 int       cellRssiDbm = 0;     // 0 = unknown
@@ -679,6 +681,7 @@ void startGNSS()
     while (millis() < end) { while (SerialAT.available()) r += (char)SerialAT.read(); if (r.indexOf("READY") >= 0) break; }
     // Position is polled on demand via AT+CGNSSINFO (no NMEA streaming) so the UART
     // stays free for HTTP/status AT commands and the fix isn't torn down each report.
+    modemBooted = true;
 }
 
 String buildTraccarUrl()
@@ -832,6 +835,9 @@ void handleCommand(const String &resp)
     else if (cmd == "report") report();
     else if (cmd == "test4g") test4gRequested = true;
     else if (cmd == "agps")   refreshAGPS();
+    else if (cmd == "wake" || cmd == "trip") {          // remote "come out of park" -> stay awake & reachable
+        stayAwake = true; stayAwakeUntil = millis() + 600000UL;   // 10-min awake window
+    }
 }
 
 void heartbeat()
@@ -918,9 +924,11 @@ void setup()
             else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> reporting cached position");
             else Serial.println("PARK: no fix and no cached position");
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
-            heartbeat();                    // status + fix source -> Home Assistant
+            heartbeat();                    // status + fix source -> HA (response may queue a "wake" cmd)
             rtcSleptSec = 0;
-            parkSleep(cfg.checkSec, true);  // modem was up -> power it down; wake in checkSec
+            if (stayAwake) Serial.println("PARK: 'wake' command -> staying awake & reachable");
+            else parkSleep(cfg.checkSec, true);  // no wake cmd -> power down; wake in checkSec
+            // (if stayAwake: don't sleep -> fall through to the awake path below)
         } else {
             // cheap ignition-check: no modem booted, straight back to sleep
             Serial.printf("PARK check: on battery (%us/%umin) -> re-sleep %us\n",
@@ -930,9 +938,8 @@ void setup()
         // parkSleep does not return
     }
 
-    // ---- Awake path: external power (TRIP), BOOT-button wake, or deep-sleep disabled ----
-    bootModem();
-    startGNSS();
+    // ---- Awake path: external power (TRIP), BOOT-button wake, remote "wake" cmd, or deep-sleep off ----
+    if (!modemBooted) { bootModem(); startGNSS(); }   // skip if a park report already booted it (no double PWRKEY)
     startNetwork();
     modeStr = powerPresent ? "TRIP" : "PARK";
     Serial.printf("%s: awake, reporting on interval (deep-sleep %s)\n", modeStr, cfg.deepSleep ? "on" : "off");

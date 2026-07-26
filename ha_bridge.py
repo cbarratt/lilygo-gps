@@ -75,11 +75,15 @@ def publish_discovery(did):
         "unique_id": f"{nid}_last_seen", "device": dev, "availability_topic": avail,
         "name": "Last reported", "device_class": "timestamp",
         "state_topic": f"tracker/{nid}/last_seen", "icon": "mdi:clock-check"}), retain=True)
-    # command buttons -> publish to cmd topic
-    for c in ("reboot", "report", "test4g"):
-        mc.publish(f"homeassistant/button/{nid}/{c}/config", json.dumps({
-            "unique_id": f"{nid}_{c}", "device": dev, "name": c.capitalize(),
-            "command_topic": f"tracker/{nid}/cmd", "payload_press": c}), retain=True)
+    # command buttons -> publish to cmd topic. "wake" tells a parked/deep-sleeping device
+    # to stay awake & reachable at its NEXT report wake (not instant - see README).
+    btns = {"reboot": "Reboot", "report": "Report", "test4g": "Test 4G", "wake": "Wake to TRIP"}
+    icons = {"wake": "mdi:car-clock", "reboot": "mdi:restart", "report": "mdi:crosshairs-gps"}
+    for c, label in btns.items():
+        cfgb = {"unique_id": f"{nid}_{c}", "device": dev, "name": label,
+                "command_topic": f"tracker/{nid}/cmd", "payload_press": c}
+        if c in icons: cfgb["icon"] = icons[c]
+        mc.publish(f"homeassistant/button/{nid}/{c}/config", json.dumps(cfgb), retain=True)
 
 def on_connect(cl, ud, flags, rc):              # (re)subscribe to every device's cmd topic
     print("MQTT connected rc=", rc)
