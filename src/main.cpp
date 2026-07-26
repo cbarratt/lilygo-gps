@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.6.1"
+#define FW_VERSION "1.7.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -77,6 +77,7 @@ struct Config {
     uint16_t parkMin;        // PARK-mode report/sleep interval (min)
     uint16_t parkFixSec;     // PARK: max seconds to wait for a fresh fix before using cached
     uint16_t checkSec;       // PARK deep-sleep: cheap power-check wake interval to catch ignition
+    uint16_t cmdSec;         // PARK: check for remote commands this often (0 = only at full report)
     uint8_t  modeOverride;   // MODE_AUTO / MODE_TRIP / MODE_PARK - manual override of power-detect
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
     bool     traccarEnabled;
@@ -106,6 +107,7 @@ void loadConfig()
     cfg.parkMin        = prefs.getUShort("pmin",  45);
     cfg.parkFixSec     = prefs.getUShort("pfix",  300);          // wait up to 5 min for a fix, else cached
     cfg.checkSec       = prefs.getUShort("chk",   60);           // deep-sleep: check for ignition every 60s
+    cfg.cmdSec         = prefs.getUShort("cmd",   0);            // PARK command-check interval (0 = off)
     cfg.modeOverride   = prefs.getUChar("mode",   MODE_AUTO);    // manual TRIP/PARK override
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
@@ -135,6 +137,7 @@ void saveConfig()
     prefs.putUShort("pmin",  cfg.parkMin);
     prefs.putUShort("pfix",  cfg.parkFixSec);
     prefs.putUShort("chk",   cfg.checkSec);
+    prefs.putUShort("cmd",   cfg.cmdSec);
     prefs.putUChar("mode",   cfg.modeOverride);
     prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putBool("ten",     cfg.traccarEnabled);
@@ -185,6 +188,7 @@ RTC_DATA_ATTR int      rtcSats = 0;
 RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
 RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
 RTC_DATA_ATTR uint32_t rtcSleptSec = 0;   // accumulated deep-sleep time toward the next full GPS report
+RTC_DATA_ATTR uint32_t rtcSinceCmd = 0;   // accumulated deep-sleep time toward the next command-check
 bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
@@ -493,6 +497,8 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <div class=hint>On each park wake, wait up to this long for a fresh GPS fix; if none, report the last known (cached) position instead. HA shows whether each report was "fresh" or "cached".</div>
 <label>Ignition-check interval (seconds, deep-sleep)</label><input type=number name=chk value="%CHK%" min=15 max=600>
 <div class=hint>In deep-sleep PARK, wake this often (cheap — no GPS/modem) just to catch the ignition coming on and switch to TRIP. Lower = faster wake when you start the car, slightly more battery.</div>
+<label>Command-check interval in PARK (seconds, 0 = off)</label><input type=number name=cmd value="%CMD%" min=0 max=3600>
+<div class=hint>While parked, how often to check for remote commands (Force TRIP / Wake) between full reports. Cheap when deep-sleep is OFF; when deep-sleep is ON each check wakes the modem — use a larger value (e.g. 600) or 0 to protect the weeks-battery.</div>
 <label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
@@ -606,6 +612,7 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%PMIN%",  String(cfg.parkMin));
     p.replace("%PFIX%",  String(cfg.parkFixSec));
     p.replace("%CHK%",   String(cfg.checkSec));
+    p.replace("%CMD%",   String(cfg.cmdSec));
     p.replace("%M0%", cfg.modeOverride == MODE_AUTO ? "selected" : "");
     p.replace("%M1%", cfg.modeOverride == MODE_TRIP ? "selected" : "");
     p.replace("%M2%", cfg.modeOverride == MODE_PARK ? "selected" : "");
@@ -633,6 +640,7 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
     if (request->hasArg("pfix"))  cfg.parkFixSec  = constrain((int)request->arg("pfix").toInt(), 30, 600);
     if (request->hasArg("chk"))   cfg.checkSec    = constrain((int)request->arg("chk").toInt(), 15, 600);
+    if (request->hasArg("cmd"))   cfg.cmdSec      = constrain((int)request->arg("cmd").toInt(), 0, 3600);
     if (request->hasArg("mode"))  cfg.modeOverride = constrain((int)request->arg("mode").toInt(), 0, 2);
     if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
@@ -943,8 +951,8 @@ void setup()
     // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
     // without paying a modem boot every time.
     if (cfg.deepSleep && !wokeByButton && !wantTrip()) {   // wantTrip(): power-detect OR manual override
-        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) rtcSleptSec += cfg.checkSec;
-        else rtcSleptSec = (uint32_t)cfg.parkMin * 60;          // fresh entry (power-on/reset) -> report now
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) { rtcSleptSec += cfg.checkSec; rtcSinceCmd += cfg.checkSec; }
+        else { rtcSleptSec = (uint32_t)cfg.parkMin * 60; rtcSinceCmd = 0; }   // fresh entry -> full report now
 
         if (rtcSleptSec >= (uint32_t)cfg.parkMin * 60) {
             // full report cycle: register, A-GPS, fresh fix (or cached), report to Traccar + HA
@@ -961,14 +969,28 @@ void setup()
             else Serial.println("PARK: no fix and no cached position");
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
             heartbeat();                    // status + fix source -> HA (response may queue a "wake" cmd)
-            rtcSleptSec = 0;
+            rtcSleptSec = 0; rtcSinceCmd = 0;
             if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
             else parkSleep(cfg.checkSec, true);  // still parked -> power down; wake in checkSec
             // (if staying awake: don't sleep -> fall through to the awake path below)
+        } else if (cfg.cmdSec > 0 && rtcSinceCmd >= (uint32_t)cfg.cmdSec) {
+            // command-check: boot modem + heartbeat ONLY (no GPS fix) so remote commands
+            // (wake/trip/park) get collected faster than the full parkMin report. Costs a
+            // modem wake each time -> keep cmdSec modest when running deep-sleep for weeks.
+            modeStr = "PARK";
+            Serial.println("PARK command-check: register + heartbeat (no GPS)...");
+            bootModem();
+            uint32_t rend = millis() + 45000;
+            while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+            loadCachedFix();                // report the last known parked position
+            heartbeat();                    // picks up any queued command
+            rtcSinceCmd = 0;
+            if (stayAwake || wantTrip()) Serial.println("PARK: command -> staying awake/TRIP");
+            else parkSleep(cfg.checkSec, true);
         } else {
             // cheap ignition-check: no modem booted, straight back to sleep
-            Serial.printf("PARK check: on battery (%us/%umin) -> re-sleep %us\n",
-                          rtcSleptSec, cfg.parkMin, cfg.checkSec);
+            Serial.printf("PARK check: on battery (%us/%umin, cmd %us) -> re-sleep %us\n",
+                          rtcSleptSec, cfg.parkMin, rtcSinceCmd, cfg.checkSec);
             parkSleep(cfg.checkSec, false); // radios never came up this wake
         }
         // parkSleep does not return
@@ -1007,7 +1029,7 @@ void loop()
         }
     }
 
-    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0, lastAgps = 0;
+    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0, lastAgps = 0, lastCmdChk = 0;
     static uint32_t powerLostSince = 0;
 
     if (millis() - lastGnss > 4000) { lastGnss = millis(); pollGnss(); }
@@ -1043,6 +1065,12 @@ void loop()
         lastReport = millis();
         if (haveFix() && cfg.traccarEnabled) report();   // position -> Traccar (fix only)
         heartbeat();                                     // status -> HA bridge (fix or not; no-op if off)
+    }
+    // PARK (awake): collect remote commands more often than the parkMin report -- cheap here
+    // (radios already up), so Force TRIP / Wake land within cmdSec instead of a full park interval.
+    if (!wantTrip() && cfg.cmdSec > 0 && millis() - lastCmdChk > (uint32_t)cfg.cmdSec * 1000UL) {
+        lastCmdChk = millis();
+        heartbeat();
     }
     if (millis() - lastLog > 5000) {
         lastLog = millis();
