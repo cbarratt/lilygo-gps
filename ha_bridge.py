@@ -47,16 +47,19 @@ def publish_discovery(did):
     dev = {"identifiers": [nid], "name": did, "manufacturer": "LilyGO", "model": "T-A7670G tracker"}
     avail = f"tracker/{nid}/availability"
 
+    # NOTE: data entities deliberately have NO availability_topic, so they keep showing their
+    # last retained values while the device is asleep between deep-sleep reports (instead of
+    # going "unavailable"). Online/offline is surfaced separately by the "Online" binary_sensor.
     def cfg(comp, key, extra):
         payload = {"unique_id": f"{nid}_{key}", "device": dev,
-                   "availability_topic": avail, "state_topic": f"tracker/{nid}/state",
+                   "state_topic": f"tracker/{nid}/state",
                    "value_template": "{{ value_json.%s }}" % key}
         payload.update(extra)
         mc.publish(f"homeassistant/{comp}/{nid}/{key}/config", json.dumps(payload), retain=True)
 
-    # location on the HA map
+    # location on the HA map (retains last position while parked/asleep)
     mc.publish(f"homeassistant/device_tracker/{nid}/loc/config", json.dumps({
-        "unique_id": f"{nid}_loc", "device": dev, "availability_topic": avail,
+        "unique_id": f"{nid}_loc", "device": dev,
         "json_attributes_topic": f"tracker/{nid}/attrs", "source_type": "gps"}), retain=True)
     # sensors
     cfg("sensor", "batt",   {"name": "Battery", "unit_of_measurement": "mV", "icon": "mdi:battery"})
@@ -73,9 +76,15 @@ def publish_discovery(did):
                                  "device_class": "connectivity"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
     mc.publish(f"homeassistant/sensor/{nid}/last_seen/config", json.dumps({
-        "unique_id": f"{nid}_last_seen", "device": dev, "availability_topic": avail,
+        "unique_id": f"{nid}_last_seen", "device": dev,
         "name": "Last reported", "device_class": "timestamp",
         "state_topic": f"tracker/{nid}/last_seen", "icon": "mdi:clock-check"}), retain=True)
+    # Online/offline as its OWN indicator (state = the availability topic). This never greys the
+    # data sensors -- they keep their last values; this just tells you if it's currently checked in.
+    mc.publish(f"homeassistant/binary_sensor/{nid}/online/config", json.dumps({
+        "unique_id": f"{nid}_online", "device": dev, "name": "Online",
+        "state_topic": avail, "payload_on": "online", "payload_off": "offline",
+        "device_class": "connectivity"}), retain=True)
     # command buttons -> publish to cmd topic. "wake" tells a parked/deep-sleeping device
     # to stay awake & reachable at its NEXT report wake (not instant - see README).
     btns = {"reboot": "Reboot", "report": "Report", "test4g": "Test 4G", "wake": "Wake to TRIP",
