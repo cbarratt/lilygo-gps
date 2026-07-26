@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -71,6 +71,7 @@ struct Config {
     uint16_t reportSec;      // TRIP-mode report interval (s)
     uint16_t parkMin;        // PARK-mode report/sleep interval (min)
     uint16_t parkFixSec;     // PARK: max seconds to wait for a fresh fix before using cached
+    uint16_t checkSec;       // PARK deep-sleep: cheap power-check wake interval to catch ignition
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
     bool     traccarEnabled;
     bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
@@ -98,6 +99,7 @@ void loadConfig()
     cfg.reportSec      = prefs.getUShort("rsec",  10);
     cfg.parkMin        = prefs.getUShort("pmin",  45);
     cfg.parkFixSec     = prefs.getUShort("pfix",  300);          // wait up to 5 min for a fix, else cached
+    cfg.checkSec       = prefs.getUShort("chk",   60);           // deep-sleep: check for ignition every 60s
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
     cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
@@ -125,6 +127,7 @@ void saveConfig()
     prefs.putUShort("rsec",  cfg.reportSec);
     prefs.putUShort("pmin",  cfg.parkMin);
     prefs.putUShort("pfix",  cfg.parkFixSec);
+    prefs.putUShort("chk",   cfg.checkSec);
     prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putBool("ten",     cfg.traccarEnabled);
     prefs.putBool("dsleep",  cfg.deepSleep);
@@ -171,6 +174,7 @@ RTC_DATA_ATTR float    rtcHdop = 0;
 RTC_DATA_ATTR int      rtcSats = 0;
 RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
 RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
+RTC_DATA_ATTR uint32_t rtcSleptSec = 0;   // accumulated deep-sleep time toward the next full GPS report
 bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
@@ -457,6 +461,8 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <label>Park interval (minutes, on battery)</label><input type=number name=pmin value="%PMIN%" min=1>
 <label>Park fix window (seconds)</label><input type=number name=pfix value="%PFIX%" min=30 max=600>
 <div class=hint>On each park wake, wait up to this long for a fresh GPS fix; if none, report the last known (cached) position instead. HA shows whether each report was "fresh" or "cached".</div>
+<label>Ignition-check interval (seconds, deep-sleep)</label><input type=number name=chk value="%CHK%" min=15 max=600>
+<div class=hint>In deep-sleep PARK, wake this often (cheap — no GPS/modem) just to catch the ignition coming on and switch to TRIP. Lower = faster wake when you start the car, slightly more battery.</div>
 <label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
@@ -568,6 +574,7 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%RSEC%",  String(cfg.reportSec));
     p.replace("%PMIN%",  String(cfg.parkMin));
     p.replace("%PFIX%",  String(cfg.parkFixSec));
+    p.replace("%CHK%",   String(cfg.checkSec));
     p.replace("%PTH%",   String(cfg.powerThreshMv));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
     p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
@@ -591,6 +598,7 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("rsec"))  cfg.reportSec   = max(5, (int)request->arg("rsec").toInt());
     if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
     if (request->hasArg("pfix"))  cfg.parkFixSec  = constrain((int)request->arg("pfix").toInt(), 30, 600);
+    if (request->hasArg("chk"))   cfg.checkSec    = constrain((int)request->arg("chk").toInt(), 15, 600);
     if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
     if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
@@ -853,15 +861,18 @@ bool waitForFix(uint32_t timeoutMs)
     return haveFix();
 }
 
-void enterParkSleep()
+// Deep-sleep for `sleepSec`, waking on the timer or the BOOT button. Powers the radios
+// down first ONLY if they were actually brought up this cycle (radiosUp), so the frequent
+// cheap ignition-check wakes stay fast and low-power (no modem to shut down).
+void parkSleep(uint32_t sleepSec, bool radiosUp)
 {
     modeStr = "PARK-SLEEP";
-    Serial.printf("PARK: sleeping %u min\n", cfg.parkMin);
-    // power down radios to actually save energy
-    atCmd("AT+CGNSSPWR=0", 1000);
-    atCmd("AT+CPOF", 2000);            // modem off (PWRKEY sequence re-boots it on wake)
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    esp_sleep_enable_timer_wakeup((uint64_t)cfg.parkMin * 60ULL * 1000000ULL);
+    if (radiosUp) {
+        atCmd("AT+CGNSSPWR=0", 1000);
+        atCmd("AT+CPOF", 2000);            // modem off (PWRKEY sequence re-boots it on wake)
+        WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    }
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);   // BOOT button (active-low) also wakes it
     delay(50);
     esp_deep_sleep_start();            // wakes into setup() again
@@ -882,28 +893,47 @@ void setup()
     Serial.printf("battery=%u mV -> power %s (threshold %u)\n",
                   battMv, powerPresent ? "PRESENT" : "ABSENT", cfg.powerThreshMv);
 
+    // ---- Deep-sleep PARK: cheap ignition-check cadence, full GPS report every parkMin ----
+    // On battery with deep-sleep on, wake briefly every checkSec WITHOUT booting the modem,
+    // purely to see if the ignition came on (charging -> powerPresent). If it did, fall
+    // through to the awake/TRIP path below. If not, only run the expensive modem+GPS report
+    // once parkMin of sleep has accumulated. This decouples "catch the ignition" (fast, cheap)
+    // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
+    // without paying a modem boot every time.
+    if (cfg.deepSleep && !wokeByButton && !powerPresent) {
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) rtcSleptSec += cfg.checkSec;
+        else rtcSleptSec = (uint32_t)cfg.parkMin * 60;          // fresh entry (power-on/reset) -> report now
+
+        if (rtcSleptSec >= (uint32_t)cfg.parkMin * 60) {
+            // full report cycle: register, A-GPS, fresh fix (or cached), report to Traccar + HA
+            modeStr = "PARK";
+            Serial.println("PARK report: register, A-GPS, acquire fix...");
+            bootModem();
+            startGNSS();
+            uint32_t rend = millis() + 45000;                   // let modem register so A-GPS can download
+            while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+            if (cfg.agps) refreshAGPS();
+            bool got = waitForFix((uint32_t)cfg.parkFixSec * 1000UL);
+            if (got) { cacheFix(); Serial.println("PARK: fresh fix acquired"); }
+            else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> reporting cached position");
+            else Serial.println("PARK: no fix and no cached position");
+            if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
+            heartbeat();                    // status + fix source -> Home Assistant
+            rtcSleptSec = 0;
+            parkSleep(cfg.checkSec, true);  // modem was up -> power it down; wake in checkSec
+        } else {
+            // cheap ignition-check: no modem booted, straight back to sleep
+            Serial.printf("PARK check: on battery (%us/%umin) -> re-sleep %us\n",
+                          rtcSleptSec, cfg.parkMin, cfg.checkSec);
+            parkSleep(cfg.checkSec, false); // radios never came up this wake
+        }
+        // parkSleep does not return
+    }
+
+    // ---- Awake path: external power (TRIP), BOOT-button wake, or deep-sleep disabled ----
     bootModem();
     startGNSS();
-
     startNetwork();
-    if (!powerPresent && cfg.deepSleep && !wokeByButton) {
-        // PARK + deep-sleep (timer wake): register, A-GPS, try for a fresh fix; if none
-        // within the window, report the cached (parked) position. Feed Traccar AND the
-        // HA heartbeat (tagged fresh/cached) so we can see how the sleep is behaving.
-        modeStr = "PARK";
-        Serial.println("PARK: registering, A-GPS, then acquiring fix...");
-        uint32_t rend = millis() + 45000;                       // let modem register so A-GPS can download
-        while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
-        if (cfg.agps) refreshAGPS();
-        bool got = waitForFix((uint32_t)cfg.parkFixSec * 1000UL);
-        if (got) { cacheFix(); Serial.println("PARK: fresh fix acquired"); }
-        else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> reporting cached position");
-        else Serial.println("PARK: no fix and no cached position");
-        if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
-        heartbeat();                    // status + fix source -> Home Assistant
-        enterParkSleep();               // does not return
-    }
-    // Otherwise stay awake (TRIP, or PARK with deep-sleep disabled) and serve the web UI.
     modeStr = powerPresent ? "TRIP" : "PARK";
     Serial.printf("%s: awake, reporting on interval (deep-sleep %s)\n", modeStr, cfg.deepSleep ? "on" : "off");
 }
@@ -949,9 +979,11 @@ void loop()
             if (!powerLostSince) powerLostSince = millis();
             // only deep-sleep if enabled, past the button-wake window, and after 60s without power
             if (cfg.deepSleep && millis() > stayAwakeUntil && millis() - powerLostSince > 60000) {
-                Serial.println("Power lost >60s -> PARK deep-sleep");
+                Serial.println("Power lost >60s -> enter PARK deep-sleep");
                 if (haveFix() && cfg.traccarEnabled) report();
-                enterParkSleep();          // does not return
+                heartbeat();
+                rtcSleptSec = 0;                  // just reported; next full report is parkMin away
+                parkSleep(cfg.checkSec, true);    // radios up -> power down; wake in checkSec to re-check power
             }
             modeStr = "PARK";              // awake PARK when deep-sleep is off
         }
