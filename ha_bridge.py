@@ -68,6 +68,7 @@ def publish_discovery(did):
     # was the last reported position a live GPS fix or the cached (parked) one, and how old
     cfg("sensor", "fixsrc", {"name": "Fix source", "icon": "mdi:map-marker-check"})
     cfg("sensor", "fixage", {"name": "Fix age", "unit_of_measurement": "s", "icon": "mdi:map-clock"})
+    cfg("sensor", "ovr",    {"name": "Mode override", "icon": "mdi:cog"})   # auto / trip / park
     cfg("binary_sensor", "fix", {"name": "GPS fix", "payload_on": "True", "payload_off": "False",
                                  "device_class": "connectivity"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
@@ -77,8 +78,10 @@ def publish_discovery(did):
         "state_topic": f"tracker/{nid}/last_seen", "icon": "mdi:clock-check"}), retain=True)
     # command buttons -> publish to cmd topic. "wake" tells a parked/deep-sleeping device
     # to stay awake & reachable at its NEXT report wake (not instant - see README).
-    btns = {"reboot": "Reboot", "report": "Report", "test4g": "Test 4G", "wake": "Wake to TRIP"}
-    icons = {"wake": "mdi:car-clock", "reboot": "mdi:restart", "report": "mdi:crosshairs-gps"}
+    btns = {"reboot": "Reboot", "report": "Report", "test4g": "Test 4G", "wake": "Wake to TRIP",
+            "auto": "Mode Auto", "trip": "Force TRIP", "park": "Force PARK"}
+    icons = {"wake": "mdi:car-clock", "reboot": "mdi:restart", "report": "mdi:crosshairs-gps",
+             "auto": "mdi:autorenew", "trip": "mdi:car-speed-limiter", "park": "mdi:sleep"}
     for c, label in btns.items():
         cfgb = {"unique_id": f"{nid}_{c}", "device": dev, "name": label,
                 "command_topic": f"tracker/{nid}/cmd", "payload_press": c}

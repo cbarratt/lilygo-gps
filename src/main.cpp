@@ -21,7 +21,12 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.5.1"
+#define FW_VERSION "1.6.0"
+
+// manual mode override (beats the power heuristic when you know what you want)
+#define MODE_AUTO 0   // power-detect decides TRIP vs PARK
+#define MODE_TRIP 1   // force TRIP: stay awake, report often, ignore power
+#define MODE_PARK 2   // force PARK: deep-sleep park even if charging
 
 // Build-time defaults injected from a gitignored .env (see load_env.py). Blank if unset —
 // creds then come from the /config page (stored in NVS) and survive OTA.
@@ -72,6 +77,7 @@ struct Config {
     uint16_t parkMin;        // PARK-mode report/sleep interval (min)
     uint16_t parkFixSec;     // PARK: max seconds to wait for a fresh fix before using cached
     uint16_t checkSec;       // PARK deep-sleep: cheap power-check wake interval to catch ignition
+    uint8_t  modeOverride;   // MODE_AUTO / MODE_TRIP / MODE_PARK - manual override of power-detect
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
     bool     traccarEnabled;
     bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
@@ -100,6 +106,7 @@ void loadConfig()
     cfg.parkMin        = prefs.getUShort("pmin",  45);
     cfg.parkFixSec     = prefs.getUShort("pfix",  300);          // wait up to 5 min for a fix, else cached
     cfg.checkSec       = prefs.getUShort("chk",   60);           // deep-sleep: check for ignition every 60s
+    cfg.modeOverride   = prefs.getUChar("mode",   MODE_AUTO);    // manual TRIP/PARK override
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
     cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
@@ -128,6 +135,7 @@ void saveConfig()
     prefs.putUShort("pmin",  cfg.parkMin);
     prefs.putUShort("pfix",  cfg.parkFixSec);
     prefs.putUShort("chk",   cfg.checkSec);
+    prefs.putUChar("mode",   cfg.modeOverride);
     prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putBool("ten",     cfg.traccarEnabled);
     prefs.putBool("dsleep",  cfg.deepSleep);
@@ -303,6 +311,18 @@ void updatePower()
     powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv);
 }
 
+// Should we be in TRIP (awake, frequent) vs PARK? Manual override wins over power-detect.
+bool wantTrip()
+{
+    if (cfg.modeOverride == MODE_TRIP) return true;
+    if (cfg.modeOverride == MODE_PARK) return false;
+    return powerPresent;                       // MODE_AUTO
+}
+const char* ovrStr()
+{
+    return cfg.modeOverride == MODE_TRIP ? "trip" : cfg.modeOverride == MODE_PARK ? "park" : "auto";
+}
+
 // extract a substring token after `key` up to the next CR/LF or comma set
 static String afterKey(const String &s, const char *key)
 {
@@ -459,6 +479,13 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <label>APN password (usually blank)</label><input type=text name=apnp value="%APNP%">
 <label>SIM PIN (blank if none)</label><input type=text name=pin value="%PIN%">
 <h2>REPORTING &amp; POWER</h2>
+<label>Mode override</label>
+<select name=mode>
+<option value=0 %M0%>Auto — power detects TRIP/PARK</option>
+<option value=1 %M1%>Force TRIP — always awake, frequent reports</option>
+<option value=2 %M2%>Force PARK — deep-sleep even if charging</option>
+</select>
+<div class=hint>Manual override of the power heuristic. Auto = normal. Force TRIP = live tracking regardless of power (uses more battery). Force PARK = save battery on demand.</div>
 <label>Trip interval (seconds, on power)</label><input type=number name=rsec value="%RSEC%" min=5>
 <label>Park interval (minutes, on battery)</label><input type=number name=pmin value="%PMIN%" min=1>
 <label>Park fix window (seconds)</label><input type=number name=pfix value="%PFIX%" min=30 max=600>
@@ -500,6 +527,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"utc\":\"" + String(utc) + "\"";
     j += ",\"battmv\":" + String(battMv);
     j += ",\"power\":" + String(powerPresent ? "true" : "false");
+    j += ",\"ovr\":\"" + String(ovrStr()) + "\"";
     j += ",\"sim\":\"" + simStatus + "\"";
     j += ",\"celldbm\":" + String(cellRssiDbm);
     j += ",\"cellreg\":" + String(cellRegistered ? "true" : "false");
@@ -577,6 +605,9 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%PMIN%",  String(cfg.parkMin));
     p.replace("%PFIX%",  String(cfg.parkFixSec));
     p.replace("%CHK%",   String(cfg.checkSec));
+    p.replace("%M0%", cfg.modeOverride == MODE_AUTO ? "selected" : "");
+    p.replace("%M1%", cfg.modeOverride == MODE_TRIP ? "selected" : "");
+    p.replace("%M2%", cfg.modeOverride == MODE_PARK ? "selected" : "");
     p.replace("%PTH%",   String(cfg.powerThreshMv));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
     p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
@@ -601,6 +632,7 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
     if (request->hasArg("pfix"))  cfg.parkFixSec  = constrain((int)request->arg("pfix").toInt(), 30, 600);
     if (request->hasArg("chk"))   cfg.checkSec    = constrain((int)request->arg("chk").toInt(), 15, 600);
+    if (request->hasArg("mode"))  cfg.modeOverride = constrain((int)request->arg("mode").toInt(), 0, 2);
     if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
     if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
@@ -835,9 +867,11 @@ void handleCommand(const String &resp)
     else if (cmd == "report") report();
     else if (cmd == "test4g") test4gRequested = true;
     else if (cmd == "agps")   refreshAGPS();
-    else if (cmd == "wake" || cmd == "trip") {          // remote "come out of park" -> stay awake & reachable
-        stayAwake = true; stayAwakeUntil = millis() + 600000UL;   // 10-min awake window
-    }
+    else if (cmd == "wake")   { stayAwake = true; stayAwakeUntil = millis() + 600000UL; }   // temporary 10-min wake
+    else if (cmd == "trip")   { cfg.modeOverride = MODE_TRIP; saveConfig();                 // force TRIP (persistent)
+                                stayAwake = true; stayAwakeUntil = millis() + 600000UL; }
+    else if (cmd == "park")   { cfg.modeOverride = MODE_PARK; saveConfig(); }               // force PARK (persistent)
+    else if (cmd == "auto")   { cfg.modeOverride = MODE_AUTO; saveConfig(); }               // back to power-detect
 }
 
 void heartbeat()
@@ -849,6 +883,7 @@ void heartbeat()
     b += ",\"sats\":" + String(fix.sats) + ",\"batt\":" + String(battMv);
     b += ",\"fixsrc\":\"" + String(fixSrcStr()) + "\",\"fixage\":" + String(fixAgeSec());
     b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
+    b += ",\"ovr\":\"" + String(ovrStr()) + "\"";
     b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false") + "}";
     String resp = httpPost(cfg.hbUrl, b);
     Serial.printf(">> heartbeat %s\n", hbStatus.c_str());
@@ -906,7 +941,7 @@ void setup()
     // once parkMin of sleep has accumulated. This decouples "catch the ignition" (fast, cheap)
     // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
     // without paying a modem boot every time.
-    if (cfg.deepSleep && !wokeByButton && !powerPresent) {
+    if (cfg.deepSleep && !wokeByButton && !wantTrip()) {   // wantTrip(): power-detect OR manual override
         if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) rtcSleptSec += cfg.checkSec;
         else rtcSleptSec = (uint32_t)cfg.parkMin * 60;          // fresh entry (power-on/reset) -> report now
 
@@ -926,9 +961,9 @@ void setup()
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
             heartbeat();                    // status + fix source -> HA (response may queue a "wake" cmd)
             rtcSleptSec = 0;
-            if (stayAwake) Serial.println("PARK: 'wake' command -> staying awake & reachable");
-            else parkSleep(cfg.checkSec, true);  // no wake cmd -> power down; wake in checkSec
-            // (if stayAwake: don't sleep -> fall through to the awake path below)
+            if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
+            else parkSleep(cfg.checkSec, true);  // still parked -> power down; wake in checkSec
+            // (if staying awake: don't sleep -> fall through to the awake path below)
         } else {
             // cheap ignition-check: no modem booted, straight back to sleep
             Serial.printf("PARK check: on battery (%us/%umin) -> re-sleep %us\n",
@@ -941,8 +976,9 @@ void setup()
     // ---- Awake path: external power (TRIP), BOOT-button wake, remote "wake" cmd, or deep-sleep off ----
     if (!modemBooted) { bootModem(); startGNSS(); }   // skip if a park report already booted it (no double PWRKEY)
     startNetwork();
-    modeStr = powerPresent ? "TRIP" : "PARK";
-    Serial.printf("%s: awake, reporting on interval (deep-sleep %s)\n", modeStr, cfg.deepSleep ? "on" : "off");
+    modeStr = wantTrip() ? "TRIP" : "PARK";
+    Serial.printf("%s: awake, reporting on interval (deep-sleep %s, override %s)\n",
+                  modeStr, cfg.deepSleep ? "on" : "off", ovrStr());
 }
 
 void loop()
@@ -981,16 +1017,19 @@ void loop()
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
         updatePower();
-        if (powerPresent) { modeStr = "TRIP"; powerLostSince = 0; }
+        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; }   // power-detect OR manual TRIP override
         else {
             if (!powerLostSince) powerLostSince = millis();
-            // only deep-sleep if enabled, past the button-wake window, and after 60s without power
-            if (cfg.deepSleep && millis() > stayAwakeUntil && millis() - powerLostSince > 60000) {
-                Serial.println("Power lost >60s -> enter PARK deep-sleep");
+            // enter deep-sleep when: AUTO -> past the wake window + 60s without power (crank-dip debounce);
+            // a manual PARK override parks promptly (ignore the debounce/wake window).
+            bool forcePark = (cfg.modeOverride == MODE_PARK);
+            bool ready = forcePark || (millis() > stayAwakeUntil && millis() - powerLostSince > 60000);
+            if (cfg.deepSleep && ready) {
+                Serial.println("PARK -> enter deep-sleep");
                 if (haveFix() && cfg.traccarEnabled) report();
                 heartbeat();
                 rtcSleptSec = 0;                  // just reported; next full report is parkMin away
-                parkSleep(cfg.checkSec, true);    // radios up -> power down; wake in checkSec to re-check power
+                parkSleep(cfg.checkSec, true);    // radios up -> power down; wake in checkSec to re-check
             }
             modeStr = "PARK";              // awake PARK when deep-sleep is off
         }
@@ -998,7 +1037,7 @@ void loop()
 
     if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); cacheFix(); }
     // TRIP reports every reportSec; PARK (awake) every parkMin
-    uint32_t interval = powerPresent ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
+    uint32_t interval = wantTrip() ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
     if (millis() - lastReport > interval) {
         lastReport = millis();
         if (haveFix() && cfg.traccarEnabled) report();   // position -> Traccar (fix only)
