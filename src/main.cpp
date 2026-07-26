@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.6.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -404,7 +404,8 @@ async function tick(){
  try{
   const s=await (await fetch('/api/status')).json();
   const cards=[
-   ['Mode', s.power?'<span class=trip>TRIP</span>':'<span class=park>PARK</span>'],
+   ['Mode', (s.ovr=='trip'||(s.ovr!='park'&&s.power))?'<span class=trip>TRIP</span>':'<span class=park>PARK</span>'],
+   ['Override', s.ovr=='auto'?'auto':'<b>'+String(s.ovr).toUpperCase()+' (forced)</b>'],
    ['Power', s.power?'external ✓':'battery'],
    ['Battery', s.battmv+' mV'],
    ['Fix',s.fix?'<span class=fix>3D FIX</span>':'<span class=nofix>NO FIX</span>'],
