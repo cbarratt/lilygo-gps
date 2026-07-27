@@ -126,6 +126,16 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             self.send_response(400); self.end_headers(); return
         did = str(d.get("id", "tracker")); nid = base(did)
+        # A cached (parked) report carries the last-known position, but there's NO live fix and
+        # no satellites tracked while the modem GNSS is off in deep sleep. Present that honestly:
+        # fix/sats reflect the live state, and we don't republish the map position for cached
+        # reports (a parked car isn't moving -> avoids wasted device_tracker history).
+        fixsrc = d.get("fixsrc")
+        live_fix = (fixsrc == "fresh")
+        if fixsrc is not None:
+            d["fix"] = live_fix
+            if not live_fix:
+                d["sats"] = 0
         with lock:
             if did not in discovered:
                 publish_discovery(did); discovered.add(did)
@@ -135,7 +145,7 @@ class H(BaseHTTPRequestHandler):
         # "last reported" = wall-clock time we received this heartbeat (ISO8601 w/ tz)
         mc.publish(f"tracker/{nid}/last_seen",
                    datetime.now(timezone.utc).isoformat(), retain=True)
-        if d.get("fix"):
+        if live_fix and d.get("lat") is not None:   # only move the map marker on a genuine fresh fix
             mc.publish(f"tracker/{nid}/attrs", json.dumps(
                 {"latitude": d.get("lat"), "longitude": d.get("lon"), "gps_accuracy": d.get("hdop", 0)}), retain=True)
         # return a queued command, if any
