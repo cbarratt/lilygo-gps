@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.7.0"
+#define FW_VERSION "1.8.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -187,8 +187,8 @@ RTC_DATA_ATTR float    rtcHdop = 0;
 RTC_DATA_ATTR int      rtcSats = 0;
 RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
 RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
-RTC_DATA_ATTR uint32_t rtcSleptSec = 0;   // accumulated deep-sleep time toward the next full GPS report
 RTC_DATA_ATTR uint32_t rtcSinceCmd = 0;   // accumulated deep-sleep time toward the next command-check
+RTC_DATA_ATTR uint8_t  rtcParked = 0;     // 1 once we've reported the parked position (report entry ONCE)
 bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
@@ -883,14 +883,19 @@ void handleCommand(const String &resp)
     else if (cmd == "auto")   { cfg.modeOverride = MODE_AUTO; saveConfig(); }               // back to power-detect
 }
 
-void heartbeat()
+void heartbeat(bool statusOnly = false)
 {
     if (!cfg.hbEnabled || cfg.hbUrl.length() == 0) return;
+    // statusOnly = a parked check-in: report NO live position (fix=false, sats=0, no lat/lon), so a
+    // parked car doesn't keep re-broadcasting a position that isn't changing. The map keeps its last
+    // fix; fixsrc stays "cached" so HA still knows a parked position is on file.
+    bool live = haveFix() && !statusOnly;
     String b = "{\"id\":\"" + cfg.deviceId + "\",\"fw\":\"" FW_VERSION "\",\"up\":" + String(millis() / 1000);
-    b += ",\"fix\":" + String(haveFix() ? "true" : "false");
-    if (haveFix()) b += ",\"lat\":" + String(fix.lat, 6) + ",\"lon\":" + String(fix.lon, 6) + ",\"hdop\":" + String(fix.hdop, 1);
-    b += ",\"sats\":" + String(fix.sats) + ",\"batt\":" + String(battMv);
-    b += ",\"fixsrc\":\"" + String(fixSrcStr()) + "\",\"fixage\":" + String(fixAgeSec());
+    b += ",\"fix\":" + String(live ? "true" : "false");
+    if (live) b += ",\"lat\":" + String(fix.lat, 6) + ",\"lon\":" + String(fix.lon, 6) + ",\"hdop\":" + String(fix.hdop, 1);
+    b += ",\"sats\":" + String(live ? fix.sats : 0) + ",\"batt\":" + String(battMv);
+    const char *fs = statusOnly ? (rtcFixValid ? "cached" : "none") : fixSrcStr();
+    b += ",\"fixsrc\":\"" + String(fs) + "\",\"fixage\":" + String(fixAgeSec());
     b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
     b += ",\"ovr\":\"" + String(ovrStr()) + "\"";
     b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false") + "}";
@@ -951,13 +956,14 @@ void setup()
     // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
     // without paying a modem boot every time.
     if (cfg.deepSleep && !wokeByButton && !wantTrip()) {   // wantTrip(): power-detect OR manual override
-        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) { rtcSleptSec += cfg.checkSec; rtcSinceCmd += cfg.checkSec; }
-        else { rtcSleptSec = (uint32_t)cfg.parkMin * 60; rtcSinceCmd = 0; }   // fresh entry -> full report now
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) rtcSinceCmd += cfg.checkSec;
+        else rtcSinceCmd = 0;
 
-        if (rtcSleptSec >= (uint32_t)cfg.parkMin * 60) {
-            // full report cycle: register, A-GPS, fresh fix (or cached), report to Traccar + HA
+        if (!rtcParked) {
+            // PARK ENTRY (once): fresh GPS fix -> report the parked position to Traccar + HA. After
+            // this we do NOT re-report position while parked -- a parked car isn't moving.
             modeStr = "PARK";
-            Serial.println("PARK report: register, A-GPS, acquire fix...");
+            Serial.println("PARK entry: register, A-GPS, acquire fix, report once...");
             bootModem();
             startGNSS();
             uint32_t rend = millis() + 45000;                   // let modem register so A-GPS can download
@@ -965,32 +971,30 @@ void setup()
             if (cfg.agps) refreshAGPS();
             bool got = waitForFix((uint32_t)cfg.parkFixSec * 1000UL);
             if (got) { cacheFix(); Serial.println("PARK: fresh fix acquired"); }
-            else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> reporting cached position");
+            else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> cached position");
             else Serial.println("PARK: no fix and no cached position");
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
-            heartbeat();                    // status + fix source -> HA (response may queue a "wake" cmd)
-            rtcSleptSec = 0; rtcSinceCmd = 0;
+            heartbeat();                    // full report (position) -> HA
+            rtcParked = 1; rtcSinceCmd = 0;
             if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
-            else parkSleep(cfg.checkSec, true);  // still parked -> power down; wake in checkSec
+            else parkSleep(cfg.checkSec, true);
             // (if staying awake: don't sleep -> fall through to the awake path below)
         } else if (cfg.cmdSec > 0 && rtcSinceCmd >= (uint32_t)cfg.cmdSec) {
-            // command-check: boot modem + heartbeat ONLY (no GPS fix) so remote commands
-            // (wake/trip/park) get collected faster than the full parkMin report. Costs a
-            // modem wake each time -> keep cmdSec modest when running deep-sleep for weeks.
+            // command-check: boot modem + STATUS-ONLY heartbeat (no GPS fix, no position, no Traccar)
+            // just to collect remote commands + refresh battery/status. No wasted position reports.
             modeStr = "PARK";
-            Serial.println("PARK command-check: register + heartbeat (no GPS)...");
+            Serial.println("PARK command-check: register + status heartbeat...");
             bootModem();
             uint32_t rend = millis() + 45000;
             while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
-            loadCachedFix();                // report the last known parked position
-            heartbeat();                    // picks up any queued command
+            heartbeat(true);                // status only; picks up any queued command
             rtcSinceCmd = 0;
             if (stayAwake || wantTrip()) Serial.println("PARK: command -> staying awake/TRIP");
             else parkSleep(cfg.checkSec, true);
         } else {
             // cheap ignition-check: no modem booted, straight back to sleep
-            Serial.printf("PARK check: on battery (%us/%umin, cmd %us) -> re-sleep %us\n",
-                          rtcSleptSec, cfg.parkMin, rtcSinceCmd, cfg.checkSec);
+            Serial.printf("PARK check: on battery (cmd %us/%us) -> re-sleep %us\n",
+                          rtcSinceCmd, cfg.cmdSec, cfg.checkSec);
             parkSleep(cfg.checkSec, false); // radios never came up this wake
         }
         // parkSleep does not return
@@ -1040,37 +1044,40 @@ void loop()
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
         updatePower();
-        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; }   // power-detect OR manual TRIP override
+        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; rtcParked = 0; }  // reset -> next park re-reports its entry position
         else {
             if (!powerLostSince) powerLostSince = millis();
-            // enter deep-sleep when: AUTO -> past the wake window + 60s without power (crank-dip debounce);
-            // a manual PARK override parks promptly (ignore the debounce/wake window).
+            // confirm parked: AUTO waits past the wake window + 60s without power (crank-dip debounce);
+            // a manual PARK override parks promptly.
             bool forcePark = (cfg.modeOverride == MODE_PARK);
             bool ready = forcePark || (millis() > stayAwakeUntil && millis() - powerLostSince > 60000);
-            if (cfg.deepSleep && ready) {
-                Serial.println("PARK -> enter deep-sleep");
+            if (ready && !rtcParked) {
+                // PARK ENTRY (once): report the parked position to Traccar + HA, then no re-reports
                 if (haveFix() && cfg.traccarEnabled) report();
                 heartbeat();
-                rtcSleptSec = 0;                  // just reported; next full report is parkMin away
-                parkSleep(cfg.checkSec, true);    // radios up -> power down; wake in checkSec to re-check
+                rtcParked = 1;
+            }
+            if (cfg.deepSleep && ready) {
+                Serial.println("PARK -> enter deep-sleep");
+                parkSleep(cfg.checkSec, true);    // entry report done; power down, wake in checkSec
             }
             modeStr = "PARK";              // awake PARK when deep-sleep is off
         }
     }
 
     if (haveFix() && millis() - lastTrack > 5000) { lastTrack = millis(); pushTrack(fix.lat, fix.lon); cacheFix(); }
-    // TRIP reports every reportSec; PARK (awake) every parkMin
-    uint32_t interval = wantTrip() ? (uint32_t)cfg.reportSec * 1000UL : (uint32_t)cfg.parkMin * 60000UL;
-    if (millis() - lastReport > interval) {
+    // TRIP: report position every reportSec. PARK does NOT re-report position (park-entry above +
+    // the cmdSec status check-in below handle it) -- a parked car isn't moving.
+    if (wantTrip() && millis() - lastReport > (uint32_t)cfg.reportSec * 1000UL) {
         lastReport = millis();
         if (haveFix() && cfg.traccarEnabled) report();   // position -> Traccar (fix only)
-        heartbeat();                                     // status -> HA bridge (fix or not; no-op if off)
+        heartbeat();                                     // status -> HA bridge
     }
     // PARK (awake): collect remote commands more often than the parkMin report -- cheap here
     // (radios already up), so Force TRIP / Wake land within cmdSec instead of a full park interval.
-    if (!wantTrip() && cfg.cmdSec > 0 && millis() - lastCmdChk > (uint32_t)cfg.cmdSec * 1000UL) {
+    if (!wantTrip() && rtcParked && cfg.cmdSec > 0 && millis() - lastCmdChk > (uint32_t)cfg.cmdSec * 1000UL) {
         lastCmdChk = millis();
-        heartbeat();
+        heartbeat(true);                                 // parked status check-in (no position)
     }
     if (millis() - lastLog > 5000) {
         lastLog = millis();
