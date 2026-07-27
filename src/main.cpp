@@ -21,7 +21,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.8.0"
+#define FW_VERSION "1.9.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -189,6 +189,7 @@ RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
 RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
 RTC_DATA_ATTR uint32_t rtcSinceCmd = 0;   // accumulated deep-sleep time toward the next command-check
 RTC_DATA_ATTR uint8_t  rtcParked = 0;     // 1 once we've reported the parked position (report entry ONCE)
+RTC_DATA_ATTR uint16_t rtcVmin = 0;       // lowest battMv seen since parking -> baseline for charge detection
 bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
@@ -305,14 +306,20 @@ uint32_t readBatteryMv()
     return n ? (sum / n) * 2 : 0;
 }
 #define NO_BATTERY_MV 2500      // below this = no cell fitted -> must be on USB (bench/dev)
+#define CHARGE_RISE_MV 70       // battMv risen this far above its parked floor = charging (ignition on)
 void updatePower()
 {
     battMv = readBatteryMv();
-    // Two "external power present" cases:
-    //  1) reading near 0  -> no battery installed, so we're running on USB
-    //  2) reading >= threshold -> charger is holding the rail up (car ignition on)
-    // Everything between = a real cell discharging on its own -> parked.
-    powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv);
+    // "External power present" three ways:
+    //  1) reading near 0            -> no battery installed, running on USB (bench/dev)
+    //  2) reading >= threshold      -> charger holding the rail up on a fairly full cell
+    //  3) reading RISING off the parked floor -> charge current is pushing voltage up (ignition on).
+    //     This catches charging a DISCHARGED battery, where the absolute threshold never trips
+    //     because the cell sits well below it while charging. rtcVmin tracks the resting/discharge
+    //     floor since parking (reset to 0 on TRIP); a rise of >CHARGE_RISE_MV above it = charging.
+    if (rtcVmin == 0 || battMv < rtcVmin) rtcVmin = battMv;
+    bool charging = (rtcVmin > NO_BATTERY_MV) && (battMv >= rtcVmin + CHARGE_RISE_MV);
+    powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv) || charging;
 }
 
 // Should we be in TRIP (awake, frequent) vs PARK? Manual override wins over power-detect.
@@ -1044,7 +1051,7 @@ void loop()
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
         updatePower();
-        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; rtcParked = 0; }  // reset -> next park re-reports its entry position
+        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; rtcParked = 0; rtcVmin = 0; }  // reset park-entry + charge-baseline
         else {
             if (!powerLostSince) powerLostSince = millis();
             // confirm parked: AUTO waits past the wake window + 60s without power (crank-dip debounce);
