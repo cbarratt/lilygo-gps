@@ -72,8 +72,10 @@ def publish_discovery(did):
     cfg("sensor", "fixsrc", {"name": "Fix source", "icon": "mdi:map-marker-check"})
     cfg("sensor", "fixage", {"name": "Fix age", "unit_of_measurement": "s", "icon": "mdi:map-clock"})
     cfg("sensor", "ovr",    {"name": "Mode override", "icon": "mdi:cog"})   # auto / trip / park
-    cfg("binary_sensor", "fix", {"name": "GPS fix", "payload_on": "True", "payload_off": "False",
-                                 "device_class": "connectivity"})
+    # plain text "Fix"/"No fix" sensor (NOT a connectivity binary_sensor -> that rendered as
+    # "Connected/Disconnected" and clashed with the Online indicator)
+    cfg("sensor", "fix", {"name": "GPS fix", "icon": "mdi:crosshairs-gps",
+                          "value_template": "{{ 'Fix' if value_json.fix else 'No fix' }}"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
     mc.publish(f"homeassistant/sensor/{nid}/last_seen/config", json.dumps({
         "unique_id": f"{nid}_last_seen", "device": dev,
