@@ -18,10 +18,11 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.9.0"
+#define FW_VERSION "1.9.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -190,6 +191,29 @@ RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measurin
 RTC_DATA_ATTR uint32_t rtcSinceCmd = 0;   // accumulated deep-sleep time toward the next command-check
 RTC_DATA_ATTR uint8_t  rtcParked = 0;     // 1 once we've reported the parked position (report entry ONCE)
 RTC_DATA_ATTR uint16_t rtcVmin = 0;       // lowest battMv seen since parking -> baseline for charge detection
+// Diagnostics: RTC_DATA_ATTR survives deep sleep + soft reset, but NOT power-on or brownout.
+// If rtcBoots is stuck at 1 every wake, RTC state is being lost -> rtcParked/rtcVmin reset each
+// cycle, which silently defeats both the park-once logic and the rising-voltage charge detection.
+RTC_DATA_ATTR uint32_t rtcBoots = 0;      // increments every setup(); resets to 0 on RTC loss
+
+// Why did we just boot? "deepsleep" = clean timer/ext wake (RTC memory intact);
+// "brownout"/"poweron" = RTC memory was wiped, so parked state and the charge baseline are lost.
+const char* resetReasonStr()
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "poweron";
+        case ESP_RST_EXT:       return "ext";
+        case ESP_RST_SW:        return "sw";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "intwdt";
+        case ESP_RST_TASK_WDT:  return "taskwdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:                return "unknown";
+    }
+}
 bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
@@ -566,6 +590,8 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"hb\":" + String(cfg.hbEnabled ? "true" : "false") + ",\"hbStatus\":\"" + hbStatus + "\",\"lastCmd\":\"" + lastCmd + "\"";
     j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
+    j += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
+    j += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
     j += "}";
     request->send(200, "application/json", j);
 }
@@ -905,7 +931,10 @@ void heartbeat(bool statusOnly = false)
     b += ",\"fixsrc\":\"" + String(fs) + "\",\"fixage\":" + String(fixAgeSec());
     b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
     b += ",\"ovr\":\"" + String(ovrStr()) + "\"";
-    b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false") + "}";
+    b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false");
+    // diagnostics: is RTC state surviving between park wakes?
+    b += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
+    b += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked) + "}";
     String resp = httpPost(cfg.hbUrl, b);
     Serial.printf(">> heartbeat %s\n", hbStatus.c_str());
     handleCommand(resp);
@@ -944,6 +973,9 @@ void setup()
 {
     Serial.begin(115200); delay(300);
     Serial.println("\n===== TTGO GPS car tracker =====");
+    rtcBoots++;
+    Serial.printf("boot #%u  reset=%s  rtcParked=%u rtcVmin=%u\n",
+                  rtcBoots, resetReasonStr(), rtcParked, rtcVmin);
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
         wokeByButton = true;
         stayAwakeUntil = millis() + 5UL * 60UL * 1000UL;   // BOOT press -> stay awake 5 min
