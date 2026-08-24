@@ -22,7 +22,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.10.1"
+#define FW_VERSION "1.11.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -169,6 +169,7 @@ uint32_t  stayAwakeUntil = 0;      // while millis() < this, don't deep-sleep (b
 bool      wokeByButton = false;
 bool      stayAwake = false;       // remote "wake" cmd picked up during a park report -> don't re-sleep
 bool      modemBooted = false;     // true once bootModem() ran this boot (avoid a double PWRKEY pulse)
+bool      gnssStarted = false;     // tracked separately: a command-check boots the modem WITHOUT GNSS
 // cellular status (refreshed by pollModemStatus)
 String    simStatus = "?";
 int       cellRssiDbm = 0;     // 0 = unknown
@@ -791,6 +792,9 @@ bool joinWiFi(uint32_t timeoutMs)
     while (WiFi.status() != WL_CONNECTED && millis() < end) delay(200);
     bool up = WiFi.status() == WL_CONNECTED;
     Serial.printf("PARK uplink: WiFi %s\n", up ? WiFi.localIP().toString().c_str() : "unavailable");
+    // Away from home the radio would otherwise sit powered, scanning and retrying, for the whole
+    // wake -- pure drain on a path that's about to use the modem instead.
+    if (!up) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
     return up;
 }
 
@@ -806,18 +810,23 @@ void bootModem()
     digitalWrite(BOARD_PWRKEY_PIN, LOW);  delay(100);
     digitalWrite(BOARD_PWRKEY_PIN, HIGH); delay(1000);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
-}
-void startGNSS()
-{
+    // Bring up the AT link HERE, not in startGNSS(). Callers that need cellular but not GNSS
+    // (the PARK command-check) call bootModem() alone; when SerialAT.begin() lived in startGNSS()
+    // those callers had a dead UART, so registration never happened and modemHttpPost() wrote
+    // into an uninitialised port -- cellular silently did nothing away from WiFi.
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
     delay(4000);
     for (int i = 0; i < 20; i++) if (atCmd("AT", 700).indexOf("OK") >= 0) break; else delay(500);
+    modemBooted = true;
+}
+void startGNSS()
+{
     atCmd("AT+CGNSSPWR=1", 3000);
     uint32_t end = millis() + 12000; String r;
     while (millis() < end) { while (SerialAT.available()) r += (char)SerialAT.read(); if (r.indexOf("READY") >= 0) break; }
     // Position is polled on demand via AT+CGNSSINFO (no NMEA streaming) so the UART
     // stays free for HTTP/status AT commands and the fix isn't torn down each report.
-    modemBooted = true;
+    gnssStarted = true;
 }
 
 String buildTraccarUrl()
@@ -1023,7 +1032,7 @@ void parkSleep(uint32_t sleepSec, bool radiosUp)
     modeStr = "PARK-SLEEP";
     if (radiosUp) {
         if (modemBooted) {                 // WiFi-only wakes never touch the modem -> no dead AT waits
-            atCmd("AT+CGNSSPWR=0", 1000);
+            if (gnssStarted) atCmd("AT+CGNSSPWR=0", 1000);
             atCmd("AT+CPOF", 2000);        // modem off (PWRKEY sequence re-boots it on wake)
         }
         WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
@@ -1124,7 +1133,10 @@ void setup()
     }
 
     // ---- Awake path: external power (TRIP), BOOT-button wake, remote "wake" cmd, or deep-sleep off ----
-    if (!modemBooted) { bootModem(); startGNSS(); }   // skip if a park report already booted it (no double PWRKEY)
+    // skip the PWRKEY pulse if a park wake already booted it, but still start GNSS if that wake
+    // was a command-check (modem up, GNSS never powered) -- otherwise TRIP would run without a fix
+    if (!modemBooted) bootModem();
+    if (!gnssStarted) startGNSS();
     startNetwork();
     modeStr = wantTrip() ? "TRIP" : "PARK";
     Serial.printf("%s: awake, reporting on interval (deep-sleep %s, override %s)\n",
