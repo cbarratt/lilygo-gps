@@ -22,7 +22,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.10.0"
+#define FW_VERSION "1.10.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -47,6 +47,7 @@
 #define MODEM_TX_PIN      26
 #define MODEM_RX_PIN      27
 #define BOARD_BAT_ADC_PIN 35     // battery voltage divider (V1.2/R2)
+#define BOARD_SOLAR_ADC_PIN 36   // solar-input divider (LilyGO utilities.h) - probed for VBUS sense
 
 HardwareSerial   SerialAT(1);
 AsyncWebServer   server(80);
@@ -351,6 +352,19 @@ uint32_t readBatteryMv()
     for (int i = 0; i < 16; i++) { uint32_t v = analogReadMilliVolts(BOARD_BAT_ADC_PIN); if (v) { sum += v; n++; } delay(2); }
     return n ? (sum / n) * 2 : 0;
 }
+
+// The board fits a second divider on the SOLAR input (GPIO36, ADC1 so it survives WiFi being up).
+// LilyGO say there is no way to read VBUS in software (LilyGo-Modem-Series issue #420), so the
+// solar pad is probably diode-isolated from USB-C and this reads ~0 with a cable plugged in. But
+// if the sense node happens to sit on the shared charger-input rail it would track VBUS, which
+// would give us deterministic ignition detection with no hardware mod at all. Cheap to find out:
+// watch this while plugging/unplugging USB. Raw pin mV, no divider factor assumed.
+uint32_t readSolarMv()
+{
+    uint32_t sum = 0; int n = 0;
+    for (int i = 0; i < 8; i++) { uint32_t v = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN); sum += v; n++; delay(2); }
+    return n ? sum / n : 0;
+}
 #define NO_BATTERY_MV 2500      // below this = no cell fitted -> must be on USB (bench/dev)
 #define CHARGE_RISE_MV 70       // battMv risen this far above its parked floor = charging (ignition on)
 #define VMIN_STEP_MV   60       // max single-step drop the parked floor will follow (sag rejection)
@@ -623,6 +637,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"up\":" + String(millis() / 1000);
     j += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
     j += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
+    j += ",\"solar\":" + String(readSolarMv());
     j += "}";
     request->send(200, "application/json", j);
 }
@@ -981,7 +996,8 @@ void heartbeat(bool statusOnly = false)
     b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false");
     // diagnostics: is RTC state surviving between park wakes?
     b += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
-    b += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked) + "}";
+    b += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
+    b += ",\"solar\":" + String(readSolarMv()) + "}";
     String resp = httpPost(cfg.hbUrl, b);
     Serial.printf(">> heartbeat %s\n", hbStatus.c_str());
     handleCommand(resp);
@@ -1031,6 +1047,7 @@ void setup()
         Serial.println("Woke via BOOT button -> staying awake 5 min for access");
     }
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
+    analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
     loadConfig();
     loadPark();          // NVS is the durable source of truth: RTC memory dies on every brownout
     Serial.printf("park state from NVS: parked=%u vmin=%u\n", rtcParked, rtcVmin);
