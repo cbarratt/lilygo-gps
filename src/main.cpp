@@ -22,7 +22,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.9.1"
+#define FW_VERSION "1.10.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -196,6 +196,28 @@ RTC_DATA_ATTR uint16_t rtcVmin = 0;       // lowest battMv seen since parking ->
 // cycle, which silently defeats both the park-once logic and the rising-voltage charge detection.
 RTC_DATA_ATTR uint32_t rtcBoots = 0;      // increments every setup(); resets to 0 on RTC loss
 
+// Park state is mirrored into NVS because RTC_DATA_ATTR does NOT survive a brownout, and this
+// board browns out on essentially every park wake (modem inrush collapses the 3.3V rail -- see
+// v1.9.1 telemetry: rst=brownout 6/6, boots stuck at 1). Losing it meant re-reporting the parked
+// position on every wake AND silently disabling charge detection, because rtcVmin got recalibrated
+// to the current battMv each time, degrading the test to "battMv >= battMv + 70" = never true.
+void savePark()
+{
+    Preferences p;
+    p.begin("park", false);
+    p.putUChar("parked", rtcParked);      // NVS skips the flash write if the value is unchanged
+    p.putUShort("vmin",  rtcVmin);
+    p.end();
+}
+void loadPark()
+{
+    Preferences p;
+    p.begin("park", true);
+    rtcParked = p.getUChar("parked", 0);
+    rtcVmin   = p.getUShort("vmin",  0);
+    p.end();
+}
+
 // Why did we just boot? "deepsleep" = clean timer/ext wake (RTC memory intact);
 // "brownout"/"poweron" = RTC memory was wiped, so parked state and the charge baseline are lost.
 const char* resetReasonStr()
@@ -331,6 +353,7 @@ uint32_t readBatteryMv()
 }
 #define NO_BATTERY_MV 2500      // below this = no cell fitted -> must be on USB (bench/dev)
 #define CHARGE_RISE_MV 70       // battMv risen this far above its parked floor = charging (ignition on)
+#define VMIN_STEP_MV   60       // max single-step drop the parked floor will follow (sag rejection)
 void updatePower()
 {
     battMv = readBatteryMv();
@@ -341,7 +364,14 @@ void updatePower()
     //     This catches charging a DISCHARGED battery, where the absolute threshold never trips
     //     because the cell sits well below it while charging. rtcVmin tracks the resting/discharge
     //     floor since parking (reset to 0 on TRIP); a rise of >CHARGE_RISE_MV above it = charging.
-    if (rtcVmin == 0 || battMv < rtcVmin) rtcVmin = battMv;
+    if (rtcVmin == 0) rtcVmin = battMv;
+    else if (battMv < rtcVmin) {
+        // A genuine resting floor creeps down slowly (~0.5 mV/h parked). A sudden deep drop is
+        // modem-TX sag (measured to 3742 mV off a 4096 mV rest). Only follow small steps, so a
+        // sag can never latch the floor low -- which would leave battMv permanently >CHARGE_RISE_MV
+        // above it and pin the tracker in a false TRIP, draining the cell.
+        if (rtcVmin - battMv <= VMIN_STEP_MV) rtcVmin = battMv;
+    }
     bool charging = (rtcVmin > NO_BATTERY_MV) && (battMv >= rtcVmin + CHARGE_RISE_MV);
     powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv) || charging;
 }
@@ -584,6 +614,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"graw\":\"" + lastGnssRaw + "\"";
     j += ",\"did\":\"" + cfg.deviceId + "\",\"thost\":\"" + cfg.traccarHost + "\",\"tport\":" + String(cfg.traccarPort);
     j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
+    j += ",\"chk\":" + String(cfg.checkSec) + ",\"cmd\":" + String(cfg.cmdSec) + ",\"pfix\":" + String(cfg.parkFixSec);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
     j += ",\"agps\":" + String(cfg.agps ? "true" : "false") + ",\"agpsStatus\":\"" + agpsStatus + "\"";
@@ -730,6 +761,22 @@ void startNetwork()
     server.on("/test4g", HTTP_GET, handleTest4g);
     server.on("/ota", HTTP_GET, handleOta);
     server.begin();
+}
+
+// Minimal STA join for a park wake: no AP, no mDNS, no web server -- we're up for seconds and
+// only need an uplink. Preferring WiFi here matters because a cellular attach/registration is the
+// biggest current burst the board makes, and it is what triggers the brownout resets.
+bool joinWiFi(uint32_t timeoutMs)
+{
+    if (!cfg.wifiSsid.length()) return false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+    uint32_t end = millis() + timeoutMs;
+    while (WiFi.status() != WL_CONNECTED && millis() < end) delay(200);
+    bool up = WiFi.status() == WL_CONNECTED;
+    Serial.printf("PARK uplink: WiFi %s\n", up ? WiFi.localIP().toString().c_str() : "unavailable");
+    return up;
 }
 
 void bootModem()
@@ -959,8 +1006,10 @@ void parkSleep(uint32_t sleepSec, bool radiosUp)
 {
     modeStr = "PARK-SLEEP";
     if (radiosUp) {
-        atCmd("AT+CGNSSPWR=0", 1000);
-        atCmd("AT+CPOF", 2000);            // modem off (PWRKEY sequence re-boots it on wake)
+        if (modemBooted) {                 // WiFi-only wakes never touch the modem -> no dead AT waits
+            atCmd("AT+CGNSSPWR=0", 1000);
+            atCmd("AT+CPOF", 2000);        // modem off (PWRKEY sequence re-boots it on wake)
+        }
         WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
     }
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
@@ -974,7 +1023,7 @@ void setup()
     Serial.begin(115200); delay(300);
     Serial.println("\n===== TTGO GPS car tracker =====");
     rtcBoots++;
-    Serial.printf("boot #%u  reset=%s  rtcParked=%u rtcVmin=%u\n",
+    Serial.printf("boot #%u  reset=%s  (RTC parked=%u vmin=%u)\n",
                   rtcBoots, resetReasonStr(), rtcParked, rtcVmin);
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
         wokeByButton = true;
@@ -983,6 +1032,8 @@ void setup()
     }
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
     loadConfig();
+    loadPark();          // NVS is the durable source of truth: RTC memory dies on every brownout
+    Serial.printf("park state from NVS: parked=%u vmin=%u\n", rtcParked, rtcVmin);
     updatePower();
     Serial.printf("battery=%u mV -> power %s (threshold %u)\n",
                   battMv, powerPresent ? "PRESENT" : "ABSENT", cfg.powerThreshMv);
@@ -1002,12 +1053,17 @@ void setup()
             // PARK ENTRY (once): fresh GPS fix -> report the parked position to Traccar + HA. After
             // this we do NOT re-report position while parked -- a parked car isn't moving.
             modeStr = "PARK";
-            Serial.println("PARK entry: register, A-GPS, acquire fix, report once...");
+            Serial.println("PARK entry: acquire fix, report once...");
             bootModem();
-            startGNSS();
-            uint32_t rend = millis() + 45000;                   // let modem register so A-GPS can download
-            while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
-            if (cfg.agps) refreshAGPS();
+            startGNSS();                                        // GNSS lives in the modem, so it must be up
+            // Uplink over home WiFi when we can. Only fall back to a cellular attach (and the
+            // A-GPS download, which needs cellular data) when WiFi is genuinely unavailable.
+            bool wifiUp = joinWiFi(12000);
+            if (!wifiUp) {
+                uint32_t rend = millis() + 45000;               // let modem register so A-GPS can download
+                while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+                if (cfg.agps) refreshAGPS();
+            }
             bool got = waitForFix((uint32_t)cfg.parkFixSec * 1000UL);
             if (got) { cacheFix(); Serial.println("PARK: fresh fix acquired"); }
             else if (loadCachedFix()) Serial.println("PARK: no fresh fix -> cached position");
@@ -1015,6 +1071,7 @@ void setup()
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
             heartbeat();                    // full report (position) -> HA
             rtcParked = 1; rtcSinceCmd = 0;
+            savePark();                     // survive the brownout that RTC memory can't
             if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
             else parkSleep(cfg.checkSec, true);
             // (if staying awake: don't sleep -> fall through to the awake path below)
@@ -1022,18 +1079,28 @@ void setup()
             // command-check: boot modem + STATUS-ONLY heartbeat (no GPS fix, no position, no Traccar)
             // just to collect remote commands + refresh battery/status. No wasted position reports.
             modeStr = "PARK";
-            Serial.println("PARK command-check: register + status heartbeat...");
-            bootModem();
-            uint32_t rend = millis() + 45000;
-            while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+            // A command-check needs no GPS and reports no position -- just an uplink to collect
+            // queued commands and refresh battery. So if home WiFi is reachable we skip the modem
+            // ENTIRELY: no PWRKEY pulse, no cellular attach, no inrush, no brownout.
+            bool wifiUp = joinWiFi(12000);
+            if (!wifiUp) {
+                Serial.println("PARK command-check: no WiFi -> modem + register");
+                bootModem();
+                uint32_t rend = millis() + 45000;
+                while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
+            } else {
+                Serial.println("PARK command-check: over WiFi (modem stays off)");
+            }
             heartbeat(true);                // status only; picks up any queued command
             rtcSinceCmd = 0;
+            savePark();
             if (stayAwake || wantTrip()) Serial.println("PARK: command -> staying awake/TRIP");
             else parkSleep(cfg.checkSec, true);
         } else {
             // cheap ignition-check: no modem booted, straight back to sleep
             Serial.printf("PARK check: on battery (cmd %us/%us) -> re-sleep %us\n",
                           rtcSinceCmd, cfg.cmdSec, cfg.checkSec);
+            savePark();                     // persist the accumulated floor before sleeping
             parkSleep(cfg.checkSec, false); // radios never came up this wake
         }
         // parkSleep does not return
@@ -1083,7 +1150,11 @@ void loop()
     if (millis() - lastPwr > 5000) {          // re-check power every 5s
         lastPwr = millis();
         updatePower();
-        if (wantTrip()) { modeStr = "TRIP"; powerLostSince = 0; rtcParked = 0; rtcVmin = 0; }  // reset park-entry + charge-baseline
+        // reset park-entry + charge-baseline; persist it, or a stale NVS floor would outlive the trip
+        if (wantTrip()) {
+            modeStr = "TRIP"; powerLostSince = 0;
+            if (rtcParked || rtcVmin) { rtcParked = 0; rtcVmin = 0; savePark(); }
+        }
         else {
             if (!powerLostSince) powerLostSince = millis();
             // confirm parked: AUTO waits past the wake window + 60s without power (crank-dip debounce);
