@@ -76,6 +76,15 @@ def publish_discovery(did):
     # "Connected/Disconnected" and clashed with the Online indicator)
     cfg("sensor", "fix", {"name": "GPS fix", "icon": "mdi:crosshairs-gps",
                           "value_template": "{{ 'Fix' if value_json.fix else 'No fix' }}"})
+    # LIS3DH motion wake (fw >= 1.12.0; defaults keep older firmware from erroring the template).
+    # "nudges" = motion wakes that failed confirmation: climbing while parked -> raise the threshold.
+    cfg("sensor", "wake",   {"name": "Wake cause", "icon": "mdi:alarm",
+                             "value_template": "{{ value_json.wake | default('n/a') }}"})
+    cfg("sensor", "moving", {"name": "Motion", "icon": "mdi:car-traction-control",
+                             "value_template": "{{ 'Moving' if value_json.moving | default(false) else 'Still' }}"})
+    cfg("sensor", "nudges", {"name": "Motion nudges", "icon": "mdi:hand-back-right",
+                             "state_class": "total_increasing",
+                             "value_template": "{{ value_json.nudges | default(0) }}"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
     mc.publish(f"homeassistant/sensor/{nid}/last_seen/config", json.dumps({
         "unique_id": f"{nid}_last_seen", "device": dev,

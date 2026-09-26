@@ -19,10 +19,12 @@
 #include <HTTPUpdate.h>
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "driver/rtc_io.h"
+#include <Wire.h>
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.11.0"
+#define FW_VERSION "1.12.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -48,6 +50,13 @@
 #define MODEM_RX_PIN      27
 #define BOARD_BAT_ADC_PIN 35     // battery voltage divider (V1.2/R2)
 #define BOARD_SOLAR_ADC_PIN 36   // solar-input divider (LilyGO utilities.h) - probed for VBUS sense
+
+// ---- LIS3DH accelerometer (optional add-on) ----
+// INT1 must be an RTC GPIO so it can wake the chip from deep sleep; 32 is free on this board.
+#define IMU_SDA_PIN  21
+#define IMU_SCL_PIN  22
+#define IMU_INT_PIN  32
+#define LIS3DH_ADDR  0x18        // SDO low/floating
 
 HardwareSerial   SerialAT(1);
 AsyncWebServer   server(80);
@@ -82,6 +91,7 @@ struct Config {
     uint16_t cmdSec;         // PARK: check for remote commands this often (0 = only at full report)
     uint8_t  modeOverride;   // MODE_AUTO / MODE_TRIP / MODE_PARK - manual override of power-detect
     uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
+    uint16_t motionMg;       // LIS3DH wake threshold (mg, high-pass filtered, 16 mg steps)
     bool     traccarEnabled;
     bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
     // cellular (4G)
@@ -112,6 +122,7 @@ void loadConfig()
     cfg.cmdSec         = prefs.getUShort("cmd",   0);            // PARK command-check interval (0 = off)
     cfg.modeOverride   = prefs.getUChar("mode",   MODE_AUTO);    // manual TRIP/PARK override
     cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
+    cfg.motionMg       = prefs.getUShort("mth",   80);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
     cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
     cfg.apn            = prefs.getString("apn",   "mobile.sky");  // Sky Mobile (O2); TM=ThingsMobile, iot.1nce.net=1NCE
@@ -142,6 +153,7 @@ void saveConfig()
     prefs.putUShort("cmd",   cfg.cmdSec);
     prefs.putUChar("mode",   cfg.modeOverride);
     prefs.putUShort("pth",   cfg.powerThreshMv);
+    prefs.putUShort("mth",   cfg.motionMg);
     prefs.putBool("ten",     cfg.traccarEnabled);
     prefs.putBool("dsleep",  cfg.deepSleep);
     prefs.putString("apn",   cfg.apn);
@@ -197,6 +209,7 @@ RTC_DATA_ATTR uint16_t rtcVmin = 0;       // lowest battMv seen since parking ->
 // If rtcBoots is stuck at 1 every wake, RTC state is being lost -> rtcParked/rtcVmin reset each
 // cycle, which silently defeats both the park-once logic and the rising-voltage charge detection.
 RTC_DATA_ATTR uint32_t rtcBoots = 0;      // increments every setup(); resets to 0 on RTC loss
+RTC_DATA_ATTR uint32_t rtcNudges = 0;     // motion wakes that failed confirmation -> tune motionMg with this
 
 // Park state is mirrored into NVS because RTC_DATA_ATTR does NOT survive a brownout, and this
 // board browns out on essentially every park wake (modem inrush collapses the 3.3V rail -- see
@@ -391,12 +404,111 @@ void updatePower()
     powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv) || charging;
 }
 
+// ---- LIS3DH motion detection ----
+// The chip's own AOI engine raises INT1 on high-pass-filtered acceleration above motionMg, so the
+// ESP32 never polls while asleep. INT1 is latched until INT1_SRC is read.
+#define MOTION_HOLD_MS         180000UL  // stay in TRIP this long after the last motion event
+#define MOTION_CONFIRM_MS      15000UL   // on a motion wake, watch this long before committing
+#define MOTION_CONFIRM_BUCKETS 3         // ...and need motion in this many distinct seconds
+bool        imuOk = false;
+bool        motionSeen = false;
+uint32_t    lastMotionMs = 0;
+uint32_t    motionCount = 0;
+const char *wakeCause = "boot";
+
+uint8_t imuRead(uint8_t reg)
+{
+    Wire.beginTransmission(LIS3DH_ADDR); Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return 0;
+    if (Wire.requestFrom((uint16_t)LIS3DH_ADDR, (uint8_t)1) != 1) return 0;
+    return Wire.read();
+}
+bool imuWrite(uint8_t reg, uint8_t val)
+{
+    Wire.beginTransmission(LIS3DH_ADDR); Wire.write(reg); Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+void imuClearLatch() { imuRead(0x31); }    // reading INT1_SRC releases the latched INT1 line
+
+// Low-power mode: 8-bit samples left-justified in the high byte, 16 mg/LSB at +/-2 g.
+// Unfiltered output, so a board lying flat reads ~[0,0,1000] -- a quick bench sanity check.
+void imuAccel(int &x, int &y, int &z)
+{
+    uint8_t b[6] = {0};
+    Wire.beginTransmission(LIS3DH_ADDR); Wire.write(0x28 | 0x80);   // OUT_X_L, auto-increment
+    if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint16_t)LIS3DH_ADDR, (uint8_t)6) == 6)
+        for (int i = 0; i < 6; i++) b[i] = Wire.read();
+    x = (int8_t)b[1] * 16; y = (int8_t)b[3] * 16; z = (int8_t)b[5] * 16;
+}
+
+void imuInit()
+{
+    Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN);
+    Wire.setClock(100000);
+    rtc_gpio_deinit((gpio_num_t)IMU_INT_PIN);   // an ext1 wake leaves the pin in RTC mode
+    pinMode(IMU_INT_PIN, INPUT_PULLDOWN);
+    imuOk = (imuRead(0x0F) == 0x33);             // WHO_AM_I
+    if (!imuOk) { Serial.println("IMU: no LIS3DH at 0x18 -> motion wake disabled"); return; }
+
+    uint8_t ths = constrain(cfg.motionMg / 16, 1, 127);
+    // The sensor stays powered and running through ESP32 deep sleep. Only (re)configure when it
+    // isn't already set up: rewriting the registers resets the high-pass filter, which can latch
+    // a bogus event right before we sleep and cost a 15 s confirm wake on every 60 s check.
+    if (imuRead(0x20) == 0x2F && imuRead(0x30) == 0x2A && imuRead(0x32) == ths) {
+        Serial.printf("IMU: LIS3DH ok (already configured, %u mg)\n", ths * 16);
+        return;
+    }
+    imuWrite(0x20, 0x2F);   // CTRL_REG1: 10 Hz, low-power, X/Y/Z on (~3 uA)
+    imuWrite(0x21, 0x01);   // CTRL_REG2: high-pass filter on the INT1 path -> gravity removed
+    imuWrite(0x22, 0x40);   // CTRL_REG3: AOI1 -> INT1 pin
+    imuWrite(0x23, 0x00);   // CTRL_REG4: +/-2 g
+    imuWrite(0x24, 0x08);   // CTRL_REG5: latch INT1 until INT1_SRC is read
+    imuWrite(0x25, 0x00);   // CTRL_REG6: INT pins active-high
+    imuWrite(0x32, ths);    // INT1_THS
+    imuWrite(0x33, 0x00);   // INT1_DURATION: fire on first sample over threshold
+    imuRead(0x26);          // REFERENCE: settle the high-pass filter
+    imuWrite(0x30, 0x2A);   // INT1_CFG: OR of X/Y/Z high events (low events would fire constantly)
+    imuClearLatch();
+    Serial.printf("IMU: LIS3DH configured, threshold %u mg\n", ths * 16);
+}
+
+void markMotion() { motionSeen = true; lastMotionMs = millis(); motionCount++; }
+bool motionActive() { return imuOk && motionSeen && millis() - lastMotionMs < MOTION_HOLD_MS; }
+
+// While awake: every latched event refreshes the TRIP hold. Cheap - one pin read per loop pass.
+void imuPoll()
+{
+    if (!imuOk || !digitalRead(IMU_INT_PIN)) return;
+    imuClearLatch();
+    markMotion();
+}
+
+// After a motion wake, decide whether it's a real drive/tow or just a knock. Radios stay off here:
+// committing to TRIP boots the modem, and modem power-up is what browns this board out on battery,
+// so a door slam must not be enough. Driving vibrates every second and passes in ~2 s.
+bool confirmMotion()
+{
+    uint32_t start = millis();
+    int buckets = 1, lastBucket = 0;              // the wake event itself counts as second 0
+    imuClearLatch();
+    while (millis() - start < MOTION_CONFIRM_MS) {
+        if (digitalRead(IMU_INT_PIN)) {
+            int b = (millis() - start) / 1000;
+            if (b != lastBucket) { buckets++; lastBucket = b; }
+            imuClearLatch();
+            if (buckets >= MOTION_CONFIRM_BUCKETS) return true;
+        }
+        delay(20);
+    }
+    return false;
+}
+
 // Should we be in TRIP (awake, frequent) vs PARK? Manual override wins over power-detect.
 bool wantTrip()
 {
     if (cfg.modeOverride == MODE_TRIP) return true;
     if (cfg.modeOverride == MODE_PARK) return false;
-    return powerPresent;                       // MODE_AUTO
+    return powerPresent || motionActive();     // MODE_AUTO
 }
 const char* ovrStr()
 {
@@ -577,6 +689,8 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <div class=hint>While parked, how often to check for remote commands (Force TRIP / Wake) between full reports. Cheap when deep-sleep is OFF; when deep-sleep is ON each check wakes the modem — use a larger value (e.g. 600) or 0 to protect the weeks-battery.</div>
 <label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
 <div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
+<label>Motion wake threshold (mg)</label><input type=number name=mth value="%MTH%" min=16 max=1000 step=16>
+<div class=hint>LIS3DH accelerometer (if fitted): movement above this wakes the tracker; sustained movement for a few seconds switches to TRIP. Lower = more sensitive. If the "nudges" count climbs while parked, raise it.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
 <div class=hint>Off = stay awake on battery (hotspot reachable, catches ignition within 5 s, uses more power). On = sleep between park reports to save battery.</div>
 <h2>HEARTBEAT (Home Assistant)</h2>
@@ -639,6 +753,13 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
     j += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
     j += ",\"solar\":" + String(readSolarMv());
+    j += ",\"wake\":\"" + String(wakeCause) + "\",\"imu\":" + String(imuOk ? "true" : "false");
+    j += ",\"moving\":" + String(motionActive() ? "true" : "false");
+    j += ",\"mcount\":" + String(motionCount) + ",\"nudges\":" + String(rtcNudges) + ",\"mth\":" + String(cfg.motionMg);
+    if (imuOk) {
+        int ax, ay, az; imuAccel(ax, ay, az);
+        j += ",\"acc\":[" + String(ax) + "," + String(ay) + "," + String(az) + "]";
+    }
     j += "}";
     request->send(200, "application/json", j);
 }
@@ -697,6 +818,7 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%M1%", cfg.modeOverride == MODE_TRIP ? "selected" : "");
     p.replace("%M2%", cfg.modeOverride == MODE_PARK ? "selected" : "");
     p.replace("%PTH%",   String(cfg.powerThreshMv));
+    p.replace("%MTH%",   String(cfg.motionMg));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
     p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
     p.replace("%APN%",   cfg.apn);   p.replace("%APNU%", cfg.apnUser); p.replace("%APNP%", cfg.apnPass);
@@ -723,6 +845,7 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("cmd"))   cfg.cmdSec      = constrain((int)request->arg("cmd").toInt(), 0, 3600);
     if (request->hasArg("mode"))  cfg.modeOverride = constrain((int)request->arg("mode").toInt(), 0, 2);
     if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
+    if (request->hasArg("mth"))   cfg.motionMg      = constrain((int)request->arg("mth").toInt(), 16, 1000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
     if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
     if (request->hasArg("apnp"))  cfg.apnPass  = request->arg("apnp");
@@ -1006,7 +1129,9 @@ void heartbeat(bool statusOnly = false)
     // diagnostics: is RTC state surviving between park wakes?
     b += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
     b += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
-    b += ",\"solar\":" + String(readSolarMv()) + "}";
+    b += ",\"solar\":" + String(readSolarMv());
+    b += ",\"wake\":\"" + String(wakeCause) + "\",\"imu\":" + String(imuOk ? "true" : "false");
+    b += ",\"moving\":" + String(motionActive() ? "true" : "false") + ",\"nudges\":" + String(rtcNudges) + "}";
     String resp = httpPost(cfg.hbUrl, b);
     Serial.printf(">> heartbeat %s\n", hbStatus.c_str());
     handleCommand(resp);
@@ -1039,6 +1164,15 @@ void parkSleep(uint32_t sleepSec, bool radiosUp)
     }
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);   // BOOT button (active-low) also wakes it
+    // Motion wake on ext1 (ext0's single slot is the BOOT button). AUTO only: Force PARK means
+    // "stay parked", so movement shouldn't wake it. The pulldown holds the line low if the
+    // sensor wire ever comes loose; ext0 keeps RTC peripherals powered so the pull works.
+    if (imuOk && cfg.modeOverride == MODE_AUTO) {
+        imuClearLatch();
+        esp_sleep_enable_ext1_wakeup(1ULL << IMU_INT_PIN, ESP_EXT1_WAKEUP_ANY_HIGH);
+        rtc_gpio_pullup_dis((gpio_num_t)IMU_INT_PIN);
+        rtc_gpio_pulldown_en((gpio_num_t)IMU_INT_PIN);
+    }
     delay(50);
     esp_deep_sleep_start();            // wakes into setup() again
 }
@@ -1064,6 +1198,24 @@ void setup()
     Serial.printf("battery=%u mV -> power %s (threshold %u)\n",
                   battMv, powerPresent ? "PRESENT" : "ABSENT", cfg.powerThreshMv);
 
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    wakeCause = cause == ESP_SLEEP_WAKEUP_EXT0  ? "button"
+              : cause == ESP_SLEEP_WAKEUP_EXT1  ? "motion"
+              : cause == ESP_SLEEP_WAKEUP_TIMER ? "timer" : "boot";
+    imuInit();
+    // Motion wake: only commit to TRIP if it's sustained. Unconfirmed -> motionActive() stays false,
+    // wantTrip() stays false, and we fall into the park block below and go back to sleep.
+    if (cause == ESP_SLEEP_WAKEUP_EXT1 && imuOk && cfg.modeOverride == MODE_AUTO && !powerPresent) {
+        if (confirmMotion()) {
+            markMotion();
+            Serial.println("MOTION confirmed -> TRIP");
+        } else {
+            wakeCause = "nudge";
+            rtcNudges++;
+            Serial.printf("motion not sustained (nudge #%u) -> back to park\n", rtcNudges);
+        }
+    }
+
     // ---- Deep-sleep PARK: cheap ignition-check cadence, full GPS report every parkMin ----
     // On battery with deep-sleep on, wake briefly every checkSec WITHOUT booting the modem,
     // purely to see if the ignition came on (charging -> powerPresent). If it did, fall
@@ -1072,8 +1224,10 @@ void setup()
     // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
     // without paying a modem boot every time.
     if (cfg.deepSleep && !wokeByButton && !wantTrip()) {   // wantTrip(): power-detect OR manual override
-        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) rtcSinceCmd += cfg.checkSec;
-        else rtcSinceCmd = 0;
+        // A nudge wake interrupts a sleep of unknown length: don't credit it, but don't reset the
+        // accumulator either, or a car that gets knocked often would never reach a command-check.
+        if (cause == ESP_SLEEP_WAKEUP_TIMER) rtcSinceCmd += cfg.checkSec;
+        else if (cause != ESP_SLEEP_WAKEUP_EXT1) rtcSinceCmd = 0;
 
         if (!rtcParked) {
             // PARK ENTRY (once): fresh GPS fix -> report the parked position to Traccar + HA. After
@@ -1148,6 +1302,7 @@ void loop()
     // async web server runs off-loop; here we just run the deferred (blocking) actions it queued
     if (rebootAt && millis() > rebootAt) { delay(50); ESP.restart(); }
     if (test4gRequested) { test4gRequested = false; test4gResult = reportCellular(); }
+    imuPoll();
     if (otaRequested)    { otaRequested = false; doOta(); }
 
     // WiFi maintenance: raise the config hotspot only when home WiFi is lost

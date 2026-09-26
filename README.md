@@ -13,6 +13,17 @@ GPS car tracker firmware for the **LILYGO T-A7670G/E/SA R2** (ESP32-WROVER-E + A
 - Pins: POWERON 12, RESET 5, PWRKEY 4 (needs a ~1 s pulse to boot), modem UART TX 26 / RX 27 @115200, battery ADC on GPIO35, BOOT button GPIO0.
 - Antennas: **active GPS** antenna → GPS socket (board supplies bias; hugely better than the ceramic patch), **LTE** antenna → LTE/MAIN u.FL socket.
 - Power in: **USB-C 5 V** (charges the 18650) or the **18650** itself. **Not 12 V** — for a car feed, drop 12 V→5 V with a fused automotive buck into USB-C, ideally off a **switched/ignition** line so "charging" == "ignition on".
+- **Optional LIS3DH accelerometer** (Adafruit breakout) for motion wake — see [Motion wake](#motion-wake-lis3dh). Firmware auto-detects it; without it everything behaves as before.
+
+  | LIS3DH | → LILYGO | Why |
+  |--------|----------|-----|
+  | VIN | 3V3 | 3.3 V so INT is a 3.3 V logic level |
+  | GND | GND | |
+  | SDA | GPIO21 | free I²C pair |
+  | SCL | GPIO22 | |
+  | INT1 | **GPIO32** | must be an RTC GPIO to wake from deep sleep |
+
+  Leave SDO/CS/A1–A3 unconnected (I²C address 0x18). The breakout's STEMMA QT socket doesn't carry INT1, so it has to be wired from the header pads.
 
 ---
 
@@ -25,7 +36,17 @@ The device is always in one of two operating modes:
 | **TRIP** | external power present (charging) | stays awake, reports every `Trip interval` seconds (default 10 s) |
 | **PARK** | on battery | reports every `Park interval` minutes (default 45); deep-sleeps between reports if enabled |
 
-**Power detection** is a heuristic on the battery ADC: `power present` when `battMv >= Power-detect threshold` (default 4200 mV) — i.e. the charger is holding the rail up. It is inherently fuzzy (charging ~4.2 V overlaps a full battery ~4.16 V); the manual override and (future) IMU exist to sidestep it.
+**Power detection** is a heuristic on the battery ADC: `power present` when `battMv >= Power-detect threshold` (default 4200 mV) — i.e. the charger is holding the rail up. It is inherently fuzzy (charging ~4.2 V overlaps a full battery ~4.16 V); the manual override and the LIS3DH motion wake exist to sidestep it. In **Auto**, TRIP = power present **or** recent confirmed motion.
+
+### Motion wake (LIS3DH)
+
+With the accelerometer fitted, the LIS3DH's own interrupt engine watches for movement (high-pass filtered, so gravity and tilt don't count) and wakes the ESP32 from deep sleep on GPIO32. The sensor draws ~3 µA and the ESP32 does no polling while asleep.
+
+- **Confirm before TRIP.** A motion wake keeps the radios **off** and watches for up to 15 s; it only switches to TRIP if it sees movement in **3 separate seconds**. Driving passes in ~2 s. A door slam or someone leaning on the car doesn't pass: that's a **nudge**, and it goes straight back to sleep without booting the modem. Modem power-up is what browns the board out on battery, so this matters.
+- **Hold.** Once in TRIP, every movement event refreshes a **3-minute hold**. After the car stops moving (and no power is detected) it waits the hold plus the usual 60 s debounce, then parks.
+- **Auto only.** Force PARK doesn't arm motion wake; Force TRIP ignores it.
+- **Tuning.** `Motion wake threshold` (default 80 mg). Watch `nudges` in the heartbeat: if it climbs while the car sits parked, raise the threshold (each nudge costs a ~15 s radio-off wake). If pulling away doesn't flip it to TRIP, lower it.
+- **Bench check.** `/api/status` shows `imu:true` and `acc:[x,y,z]` in mg. Lying flat, that should read roughly `[0,0,1000]`.
 
 ### Manual mode override
 
@@ -55,6 +76,7 @@ You **cannot push** to a deep-sleeping device — it only wakes on its timer, th
 
 - **BOOT button** — wakes it and keeps it awake 5 min (web UI reachable). Also the reliable way to get it OTA-able.
 - **Ignition (charging)** — caught within `Ignition-check interval` (~60 s) → TRIP.
+- **Movement** (LIS3DH fitted, Auto mode) — instant wake; TRIP after ~2 s of sustained motion.
 - **HA `Wake to TRIP` / `Force TRIP`** — queued and collected on the next heartbeat: seconds in TRIP, `cmdSec` in PARK (or the full park interval if `cmdSec` = 0).
 
 ---
@@ -72,6 +94,7 @@ You **cannot push** to a deep-sleeping device — it only wakes on its timer, th
 | Ignition-check interval (s) | `chk` | 60 | cheap ADC wake cadence to catch the charger |
 | Command-check interval in PARK (s) | `cmd` | 0 | remote-command poll while parked (0 = off) |
 | Power-detect threshold (mV) | `pth` | 4200 | battMv at/above = "external power" |
+| Motion wake threshold (mg) | `mth` | 80 | LIS3DH movement threshold (16 mg steps) |
 | Deep-sleep when on battery | `dsleep` | off | deep-sleep in PARK for weeks battery |
 | Cellular: APN / user / pass / PIN | `apn` … | mobile.sky | 4G |
 | Use 4G / prefer 4G | `cell` `pcell` | on / off | uplink selection |
