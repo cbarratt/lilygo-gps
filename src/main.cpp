@@ -1,11 +1,12 @@
 /**
  * T-A7670G (A7670E-FASE built-in GNSS) GPS car tracker with onboard web UI.
- *   TRIP mode  (external/USB power present): stay awake, report every reportSec.
- *   PARK mode  (running on 18650, power lost): report once, then deep-sleep parkMin.
- * Power state is inferred from the battery ADC (GPIO35): on USB the reading is
- * pinned high; on battery it reads the real (lower, sagging) cell voltage.
- *   - Status page  (/)        live fix, sats, map+trail, power/mode, battery mV
- *   - Config page  (/config)  WiFi, Traccar, park interval, power threshold
+ *   TRIP mode  (sustained movement, via the LIS3DH): stay awake, report every reportSec.
+ *   PARK mode  (no movement for ~4 min): report once, then deep-sleep until the next
+ *              check-in (cmdSec) or until motion / the BOOT button wakes it.
+ * Battery voltage (GPIO35) is telemetry only -- it does NOT decide the mode. Charging
+ * voltage overlaps the discharge range, so it could never reliably detect the ignition.
+ *   - Status page  (/)        live fix, sats, map+trail, mode/motion, battery mV
+ *   - Config page  (/config)  WiFi, Traccar, check-in interval, motion threshold
  *   - AP fallback   TTGO-GPS-Setup ; mDNS http://ttgo-gps.local
  * Uplink is WiFi for now (4G to be added when SIM+antenna arrive).
  */
@@ -24,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.12.1"
+#define FW_VERSION "1.13.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -49,7 +50,6 @@
 #define MODEM_TX_PIN      26
 #define MODEM_RX_PIN      27
 #define BOARD_BAT_ADC_PIN 35     // battery voltage divider (V1.2/R2)
-#define BOARD_SOLAR_ADC_PIN 36   // solar-input divider (LilyGO utilities.h) - probed for VBUS sense
 
 // ---- LIS3DH accelerometer (optional add-on) ----
 // INT1 must be an RTC GPIO so it can wake the chip from deep sleep; 32 is free on this board.
@@ -85,12 +85,9 @@ struct Config {
     String   traccarHost, deviceId;
     uint16_t traccarPort;
     uint16_t reportSec;      // TRIP-mode report interval (s)
-    uint16_t parkMin;        // PARK-mode report/sleep interval (min)
     uint16_t parkFixSec;     // PARK: max seconds to wait for a fresh fix before using cached
-    uint16_t checkSec;       // PARK deep-sleep: cheap power-check wake interval to catch ignition
-    uint16_t cmdSec;         // PARK: check for remote commands this often (0 = only at full report)
-    uint8_t  modeOverride;   // MODE_AUTO / MODE_TRIP / MODE_PARK - manual override of power-detect
-    uint16_t powerThreshMv;  // battery mV at/above which we call it "external power"
+    uint16_t cmdSec;         // PARK: check in (status + remote commands) this often; 0 = only on motion
+    uint8_t  modeOverride;   // MODE_AUTO / MODE_TRIP / MODE_PARK - manual override of motion detection
     uint16_t motionMg;       // LIS3DH wake threshold (mg, high-pass filtered, 16 mg steps)
     bool     traccarEnabled;
     bool     deepSleep;      // PARK: deep-sleep between reports (off = stay awake, reachable)
@@ -116,12 +113,9 @@ void loadConfig()
     cfg.traccarPort    = prefs.getUShort("tport", 5055);
     cfg.deviceId       = prefs.getString("did",   "ttgo-a7670-01");
     cfg.reportSec      = prefs.getUShort("rsec",  10);
-    cfg.parkMin        = prefs.getUShort("pmin",  45);
     cfg.parkFixSec     = prefs.getUShort("pfix",  300);          // wait up to 5 min for a fix, else cached
-    cfg.checkSec       = prefs.getUShort("chk",   60);           // deep-sleep: check for ignition every 60s
-    cfg.cmdSec         = prefs.getUShort("cmd",   0);            // PARK command-check interval (0 = off)
+    cfg.cmdSec         = prefs.getUShort("cmd",   0);            // PARK check-in interval (0 = motion only)
     cfg.modeOverride   = prefs.getUChar("mode",   MODE_AUTO);    // manual TRIP/PARK override
-    cfg.powerThreshMv  = prefs.getUShort("pth",   4150);
     cfg.motionMg       = prefs.getUShort("mth",   80);
     cfg.traccarEnabled = prefs.getBool("ten",     true);
     cfg.deepSleep      = prefs.getBool("dsleep",  false);         // default OFF for now
@@ -147,12 +141,9 @@ void saveConfig()
     prefs.putUShort("tport", cfg.traccarPort);
     prefs.putString("did",   cfg.deviceId);
     prefs.putUShort("rsec",  cfg.reportSec);
-    prefs.putUShort("pmin",  cfg.parkMin);
     prefs.putUShort("pfix",  cfg.parkFixSec);
-    prefs.putUShort("chk",   cfg.checkSec);
     prefs.putUShort("cmd",   cfg.cmdSec);
     prefs.putUChar("mode",   cfg.modeOverride);
-    prefs.putUShort("pth",   cfg.powerThreshMv);
     prefs.putUShort("mth",   cfg.motionMg);
     prefs.putBool("ten",     cfg.traccarEnabled);
     prefs.putBool("dsleep",  cfg.deepSleep);
@@ -175,7 +166,6 @@ bool      apMode = false;
 int       lastPostCode = 0;
 uint32_t  lastPostMs = 0;
 uint32_t  battMv = 0;
-bool      powerPresent = true;
 const char *modeStr = "BOOT";
 uint32_t  stayAwakeUntil = 0;      // while millis() < this, don't deep-sleep (button-wake window)
 bool      wokeByButton = false;
@@ -202,26 +192,21 @@ RTC_DATA_ATTR float    rtcHdop = 0;
 RTC_DATA_ATTR int      rtcSats = 0;
 RTC_DATA_ATTR uint8_t  rtcFixValid = 0;
 RTC_DATA_ATTR long     rtcFixEpoch = 0;   // UTC epoch of that fix, for measuring age
-RTC_DATA_ATTR uint32_t rtcSinceCmd = 0;   // accumulated deep-sleep time toward the next command-check
 RTC_DATA_ATTR uint8_t  rtcParked = 0;     // 1 once we've reported the parked position (report entry ONCE)
-RTC_DATA_ATTR uint16_t rtcVmin = 0;       // lowest battMv seen since parking -> baseline for charge detection
+RTC_DATA_ATTR time_t   rtcCheckDue = 0;   // system time of the next PARK check-in (0 = due now)
 // Diagnostics: RTC_DATA_ATTR survives deep sleep + soft reset, but NOT power-on or brownout.
-// If rtcBoots is stuck at 1 every wake, RTC state is being lost -> rtcParked/rtcVmin reset each
-// cycle, which silently defeats both the park-once logic and the rising-voltage charge detection.
+// If rtcBoots is stuck at 1 every wake, RTC state is being lost.
 RTC_DATA_ATTR uint32_t rtcBoots = 0;      // increments every setup(); resets to 0 on RTC loss
 RTC_DATA_ATTR uint32_t rtcNudges = 0;     // motion wakes that failed confirmation -> tune motionMg with this
 
-// Park state is mirrored into NVS because RTC_DATA_ATTR does NOT survive a brownout, and this
-// board browns out on essentially every park wake (modem inrush collapses the 3.3V rail -- see
-// v1.9.1 telemetry: rst=brownout 6/6, boots stuck at 1). Losing it meant re-reporting the parked
-// position on every wake AND silently disabling charge detection, because rtcVmin got recalibrated
-// to the current battMv each time, degrading the test to "battMv >= battMv + 70" = never true.
+// The parked flag is mirrored into NVS because RTC_DATA_ATTR does NOT survive a brownout, and a
+// modem power-up on battery can brown this board out. Losing it meant re-running the full park
+// entry (modem + GPS fix + position report) on every wake.
 void savePark()
 {
     Preferences p;
     p.begin("park", false);
     p.putUChar("parked", rtcParked);      // NVS skips the flash write if the value is unchanged
-    p.putUShort("vmin",  rtcVmin);
     p.end();
 }
 void loadPark()
@@ -229,12 +214,11 @@ void loadPark()
     Preferences p;
     p.begin("park", true);
     rtcParked = p.getUChar("parked", 0);
-    rtcVmin   = p.getUShort("vmin",  0);
     p.end();
 }
 
 // Why did we just boot? "deepsleep" = clean timer/ext wake (RTC memory intact);
-// "brownout"/"poweron" = RTC memory was wiped, so parked state and the charge baseline are lost.
+// "brownout"/"poweron" = RTC memory was wiped (NVS still has the parked flag).
 const char* resetReasonStr()
 {
     switch (esp_reset_reason()) {
@@ -359,49 +343,12 @@ String reportCellular();
 void   reportWiFi();
 void   report();
 
-// battery/power sensing: median-ish of a few samples, x2 for the divider
+// battery voltage (telemetry only): average of a few samples, x2 for the divider
 uint32_t readBatteryMv()
 {
     uint32_t sum = 0; int n = 0;
     for (int i = 0; i < 16; i++) { uint32_t v = analogReadMilliVolts(BOARD_BAT_ADC_PIN); if (v) { sum += v; n++; } delay(2); }
     return n ? (sum / n) * 2 : 0;
-}
-
-// The board fits a second divider on the SOLAR input (GPIO36, ADC1 so it survives WiFi being up).
-// LilyGO say there is no way to read VBUS in software (LilyGo-Modem-Series issue #420), so the
-// solar pad is probably diode-isolated from USB-C and this reads ~0 with a cable plugged in. But
-// if the sense node happens to sit on the shared charger-input rail it would track VBUS, which
-// would give us deterministic ignition detection with no hardware mod at all. Cheap to find out:
-// watch this while plugging/unplugging USB. Raw pin mV, no divider factor assumed.
-uint32_t readSolarMv()
-{
-    uint32_t sum = 0; int n = 0;
-    for (int i = 0; i < 8; i++) { uint32_t v = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN); sum += v; n++; delay(2); }
-    return n ? sum / n : 0;
-}
-#define NO_BATTERY_MV 2500      // below this = no cell fitted -> must be on USB (bench/dev)
-#define CHARGE_RISE_MV 70       // battMv risen this far above its parked floor = charging (ignition on)
-#define VMIN_STEP_MV   60       // max single-step drop the parked floor will follow (sag rejection)
-void updatePower()
-{
-    battMv = readBatteryMv();
-    // "External power present" three ways:
-    //  1) reading near 0            -> no battery installed, running on USB (bench/dev)
-    //  2) reading >= threshold      -> charger holding the rail up on a fairly full cell
-    //  3) reading RISING off the parked floor -> charge current is pushing voltage up (ignition on).
-    //     This catches charging a DISCHARGED battery, where the absolute threshold never trips
-    //     because the cell sits well below it while charging. rtcVmin tracks the resting/discharge
-    //     floor since parking (reset to 0 on TRIP); a rise of >CHARGE_RISE_MV above it = charging.
-    if (rtcVmin == 0) rtcVmin = battMv;
-    else if (battMv < rtcVmin) {
-        // A genuine resting floor creeps down slowly (~0.5 mV/h parked). A sudden deep drop is
-        // modem-TX sag (measured to 3742 mV off a 4096 mV rest). Only follow small steps, so a
-        // sag can never latch the floor low -- which would leave battMv permanently >CHARGE_RISE_MV
-        // above it and pin the tracker in a false TRIP, draining the cell.
-        if (rtcVmin - battMv <= VMIN_STEP_MV) rtcVmin = battMv;
-    }
-    bool charging = (rtcVmin > NO_BATTERY_MV) && (battMv >= rtcVmin + CHARGE_RISE_MV);
-    powerPresent = (battMv < NO_BATTERY_MV) || (battMv >= cfg.powerThreshMv) || charging;
 }
 
 // ---- LIS3DH motion detection ----
@@ -509,12 +456,43 @@ bool confirmMotion()
     return false;
 }
 
-// Should we be in TRIP (awake, frequent) vs PARK? Manual override wins over power-detect.
+// Should we be in TRIP (awake, frequent) vs PARK? Manual override wins over motion detection.
+// Without a LIS3DH fitted, AUTO never enters TRIP on its own -- use Force TRIP.
 bool wantTrip()
 {
     if (cfg.modeOverride == MODE_TRIP) return true;
     if (cfg.modeOverride == MODE_PARK) return false;
-    return powerPresent || motionActive();     // MODE_AUTO
+    return motionActive();                     // MODE_AUTO
+}
+
+// ---- PARK check-in schedule ----
+// Deep sleep goes straight to the next check-in rather than waking every minute: those wakes only
+// existed to read the battery for charging, which motion detection has replaced. System time keeps
+// running through deep sleep, so an early wake (a motion nudge) resumes the same schedule instead of
+// restarting the countdown - a car that gets knocked often would otherwise never check in.
+// cmdSec 0 = no timed check-ins (motion / BOOT only), unless there's no LIS3DH, in which case check
+// in hourly so the device can never become unreachable.
+uint32_t checkInEvery() { return cfg.cmdSec ? cfg.cmdSec : (imuOk ? 0 : 3600); }
+void scheduleCheckIn()
+{
+    uint32_t every = checkInEvery();
+    rtcCheckDue = every ? time(nullptr) + every : 0;
+}
+uint32_t secsToCheckIn()
+{
+    uint32_t every = checkInEvery();
+    if (!every) return 0;                                  // no timer: motion / BOOT wake only
+    time_t now = time(nullptr);
+    // due, never set, or implausibly far out (clock jumped, e.g. first GPS time sync) -> fresh slot
+    if (!rtcCheckDue || rtcCheckDue <= now || rtcCheckDue - now > (time_t)every) scheduleCheckIn();
+    return (uint32_t)max((time_t)1, rtcCheckDue - now);
+}
+// The RTC slow clock drifts a few %, so a timer wake can land slightly before rtcCheckDue - any
+// timer wake is by definition the scheduled check-in.
+bool checkInDue(esp_sleep_wakeup_cause_t cause)
+{
+    if (!checkInEvery()) return false;
+    return cause == ESP_SLEEP_WAKEUP_TIMER || !rtcCheckDue || time(nullptr) >= rtcCheckDue;
 }
 const char* ovrStr()
 {
@@ -602,9 +580,9 @@ async function tick(){
  try{
   const s=await (await fetch('/api/status')).json();
   const cards=[
-   ['Mode', (s.ovr=='trip'||(s.ovr!='park'&&s.power))?'<span class=trip>TRIP</span>':'<span class=park>PARK</span>'],
+   ['Mode', s.mode=='TRIP'?'<span class=trip>TRIP</span>':'<span class=park>PARK</span>'],
    ['Override', s.ovr=='auto'?'auto':'<b>'+String(s.ovr).toUpperCase()+' (forced)</b>'],
-   ['Power', s.power?'external ✓':'battery'],
+   ['Motion', !s.imu?'no sensor':(s.moving?'moving':'still')+' · woke: '+s.wake],
    ['Battery', s.battmv+' mV'],
    ['Fix',s.fix?'<span class=fix>3D FIX</span>':'<span class=nofix>NO FIX</span>'],
    ['Latitude',s.fix?fmt(s.lat,6):'–'],['Longitude',s.fix?fmt(s.lon,6):'–'],
@@ -682,19 +660,14 @@ a{color:#58a6ff}.hint{font-size:12px;color:#6e7681;margin-top:3px}
 <select name=mode>
 <option value=0 %M0%>Auto — power detects TRIP/PARK</option>
 <option value=1 %M1%>Force TRIP — always awake, frequent reports</option>
-<option value=2 %M2%>Force PARK — deep-sleep even if charging</option>
+<option value=2 %M2%>Force PARK — deep-sleep even when moving</option>
 </select>
-<div class=hint>Manual override of the power heuristic. Auto = normal. Force TRIP = live tracking regardless of power (uses more battery). Force PARK = save battery on demand.</div>
-<label>Trip interval (seconds, on power)</label><input type=number name=rsec value="%RSEC%" min=5>
-<label>Park interval (minutes, on battery)</label><input type=number name=pmin value="%PMIN%" min=1>
+<div class=hint>Manual override of motion detection. Auto = normal (movement → TRIP). Force TRIP = live tracking regardless (uses more battery). Force PARK = save battery on demand.</div>
+<label>Trip interval (seconds, while moving)</label><input type=number name=rsec value="%RSEC%" min=5>
 <label>Park fix window (seconds)</label><input type=number name=pfix value="%PFIX%" min=30 max=600>
-<div class=hint>On each park wake, wait up to this long for a fresh GPS fix; if none, report the last known (cached) position instead. HA shows whether each report was "fresh" or "cached".</div>
-<label>Ignition-check interval (seconds, deep-sleep)</label><input type=number name=chk value="%CHK%" min=15 max=600>
-<div class=hint>In deep-sleep PARK, wake this often (cheap — no GPS/modem) just to catch the ignition coming on and switch to TRIP. Lower = faster wake when you start the car, slightly more battery.</div>
-<label>Command-check interval in PARK (seconds, 0 = off)</label><input type=number name=cmd value="%CMD%" min=0 max=3600>
-<div class=hint>While parked, how often to check for remote commands (Force TRIP / Wake) between full reports. Cheap when deep-sleep is OFF; when deep-sleep is ON each check wakes the modem — use a larger value (e.g. 600) or 0 to protect the weeks-battery.</div>
-<label>Power-detect threshold (mV)</label><input type=number name=pth value="%PTH%" min=3000 max=5000>
-<div class=hint>Battery reads above this = "external power" (TRIP). Set between the on-USB and on-battery readings shown on the status page.</div>
+<div class=hint>When parking, wait up to this long for a fresh GPS fix; if none, report the last known (cached) position instead. HA shows whether each report was "fresh" or "cached".</div>
+<label>Park check-in interval (seconds, 0 = motion only)</label><input type=number name=cmd value="%CMD%" min=0 max=3600>
+<div class=hint>While parked, how often to check in with HA (battery + remote commands like Force TRIP). Over home WiFi this doesn't touch the modem; away from WiFi each check-in wakes the modem. 0 = no timed check-ins — it only wakes on movement or the BOOT button.</div>
 <label>Motion wake threshold (mg)</label><input type=number name=mth value="%MTH%" min=16 max=1000 step=16>
 <div class=hint>LIS3DH accelerometer (if fitted): movement above this wakes the tracker; sustained movement for a few seconds switches to TRIP. Lower = more sensitive. If the "nudges" count climbs while parked, raise it.</div>
 <div class=row><input type=checkbox name=dsleep %DSLEEP% id=dsleep><label for=dsleep style=margin:0>Deep-sleep when on battery (PARK)</label></div>
@@ -729,7 +702,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     if (haveFix()) snprintf(utc, sizeof(utc), "%02d:%02d:%02d", fix.h, fix.m, fix.s);
     j += ",\"utc\":\"" + String(utc) + "\"";
     j += ",\"battmv\":" + String(battMv);
-    j += ",\"power\":" + String(powerPresent ? "true" : "false");
+    j += ",\"mode\":\"" + String(wantTrip() ? "TRIP" : "PARK") + "\"";
     j += ",\"ovr\":\"" + String(ovrStr()) + "\"";
     j += ",\"sim\":\"" + simStatus + "\"";
     j += ",\"celldbm\":" + String(cellRssiDbm);
@@ -748,8 +721,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"fw\":\"" FW_VERSION "\",\"ota\":\"" + otaStatus + "\"";
     j += ",\"graw\":\"" + lastGnssRaw + "\"";
     j += ",\"did\":\"" + cfg.deviceId + "\",\"thost\":\"" + cfg.traccarHost + "\",\"tport\":" + String(cfg.traccarPort);
-    j += ",\"rsec\":" + String(cfg.reportSec) + ",\"pmin\":" + String(cfg.parkMin) + ",\"pth\":" + String(cfg.powerThreshMv);
-    j += ",\"chk\":" + String(cfg.checkSec) + ",\"cmd\":" + String(cfg.cmdSec) + ",\"pfix\":" + String(cfg.parkFixSec);
+    j += ",\"rsec\":" + String(cfg.reportSec) + ",\"cmd\":" + String(cfg.cmdSec) + ",\"pfix\":" + String(cfg.parkFixSec);
     j += ",\"dsleep\":" + String(cfg.deepSleep ? "true" : "false");
     j += ",\"pcell\":" + String(cfg.preferCell ? "true" : "false");
     j += ",\"agps\":" + String(cfg.agps ? "true" : "false") + ",\"agpsStatus\":\"" + agpsStatus + "\"";
@@ -757,8 +729,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     j += ",\"awakeLeft\":" + String(stayAwakeUntil > millis() ? (stayAwakeUntil - millis()) / 1000 : 0);
     j += ",\"up\":" + String(millis() / 1000);
     j += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
-    j += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
-    j += ",\"solar\":" + String(readSolarMv());
+    j += ",\"parked\":" + String(rtcParked);
     j += ",\"wake\":\"" + String(wakeCause) + "\",\"imu\":" + String(imuOk ? "true" : "false");
     j += ",\"moving\":" + String(motionActive() ? "true" : "false");
     j += ",\"mcount\":" + String(motionCount) + ",\"nudges\":" + String(rtcNudges) + ",\"mth\":" + String(cfg.motionMg);
@@ -816,14 +787,11 @@ void handleConfig(AsyncWebServerRequest *request) {
     p.replace("%THOST%", cfg.traccarHost); p.replace("%TPORT%", String(cfg.traccarPort));
     p.replace("%DID%",   cfg.deviceId);
     p.replace("%RSEC%",  String(cfg.reportSec));
-    p.replace("%PMIN%",  String(cfg.parkMin));
     p.replace("%PFIX%",  String(cfg.parkFixSec));
-    p.replace("%CHK%",   String(cfg.checkSec));
     p.replace("%CMD%",   String(cfg.cmdSec));
     p.replace("%M0%", cfg.modeOverride == MODE_AUTO ? "selected" : "");
     p.replace("%M1%", cfg.modeOverride == MODE_TRIP ? "selected" : "");
     p.replace("%M2%", cfg.modeOverride == MODE_PARK ? "selected" : "");
-    p.replace("%PTH%",   String(cfg.powerThreshMv));
     p.replace("%MTH%",   String(cfg.motionMg));
     p.replace("%TEN%",   cfg.traccarEnabled ? "checked" : "");
     p.replace("%DSLEEP%",cfg.deepSleep ? "checked" : "");
@@ -845,12 +813,9 @@ void handleSave(AsyncWebServerRequest *request) {
     if (request->hasArg("tport")) cfg.traccarPort = request->arg("tport").toInt();
     if (request->hasArg("did"))   cfg.deviceId    = request->arg("did");
     if (request->hasArg("rsec"))  cfg.reportSec   = max(5, (int)request->arg("rsec").toInt());
-    if (request->hasArg("pmin"))  cfg.parkMin     = max(1, (int)request->arg("pmin").toInt());
     if (request->hasArg("pfix"))  cfg.parkFixSec  = constrain((int)request->arg("pfix").toInt(), 30, 600);
-    if (request->hasArg("chk"))   cfg.checkSec    = constrain((int)request->arg("chk").toInt(), 15, 600);
     if (request->hasArg("cmd"))   cfg.cmdSec      = constrain((int)request->arg("cmd").toInt(), 0, 3600);
     if (request->hasArg("mode"))  cfg.modeOverride = constrain((int)request->arg("mode").toInt(), 0, 2);
-    if (request->hasArg("pth"))   cfg.powerThreshMv = constrain((int)request->arg("pth").toInt(), 3000, 5000);
     if (request->hasArg("mth"))   cfg.motionMg      = constrain((int)request->arg("mth").toInt(), 16, 1000);
     if (request->hasArg("apn"))   cfg.apn      = request->arg("apn");
     if (request->hasArg("apnu"))  cfg.apnUser  = request->arg("apnu");
@@ -1129,13 +1094,12 @@ void heartbeat(bool statusOnly = false)
     b += ",\"sats\":" + String(live ? fix.sats : 0) + ",\"batt\":" + String(battMv);
     const char *fs = statusOnly ? (rtcFixValid ? "cached" : "none") : fixSrcStr();
     b += ",\"fixsrc\":\"" + String(fs) + "\",\"fixage\":" + String(fixAgeSec());
-    b += ",\"mode\":\"" + String(modeStr) + "\",\"power\":" + String(powerPresent ? "true" : "false");
+    b += ",\"mode\":\"" + String(modeStr) + "\"";
     b += ",\"ovr\":\"" + String(ovrStr()) + "\"";
     b += ",\"sim\":\"" + simStatus + "\",\"signal\":" + String(cellRssiDbm) + ",\"reg\":" + String(cellRegistered ? "true" : "false");
     // diagnostics: is RTC state surviving between park wakes?
     b += ",\"rst\":\"" + String(resetReasonStr()) + "\",\"boots\":" + String(rtcBoots);
-    b += ",\"vmin\":" + String(rtcVmin) + ",\"parked\":" + String(rtcParked);
-    b += ",\"solar\":" + String(readSolarMv());
+    b += ",\"parked\":" + String(rtcParked);
     b += ",\"wake\":\"" + String(wakeCause) + "\",\"imu\":" + String(imuOk ? "true" : "false");
     b += ",\"moving\":" + String(motionActive() ? "true" : "false") + ",\"nudges\":" + String(rtcNudges) + "}";
     String resp = httpPost(cfg.hbUrl, b);
@@ -1168,7 +1132,7 @@ void parkSleep(uint32_t sleepSec, bool radiosUp)
         }
         WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
     }
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
+    if (sleepSec) esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);   // 0 = no timer
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);   // BOOT button (active-low) also wakes it
     // Motion wake on ext1 (ext0's single slot is the BOOT button). AUTO only: Force PARK means
     // "stay parked", so movement shouldn't wake it. The pulldown holds the line low if the
@@ -1188,21 +1152,17 @@ void setup()
     Serial.begin(115200); delay(300);
     Serial.println("\n===== TTGO GPS car tracker =====");
     rtcBoots++;
-    Serial.printf("boot #%u  reset=%s  (RTC parked=%u vmin=%u)\n",
-                  rtcBoots, resetReasonStr(), rtcParked, rtcVmin);
+    Serial.printf("boot #%u  reset=%s  (RTC parked=%u)\n", rtcBoots, resetReasonStr(), rtcParked);
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
         wokeByButton = true;
         stayAwakeUntil = millis() + 5UL * 60UL * 1000UL;   // BOOT press -> stay awake 5 min
         Serial.println("Woke via BOOT button -> staying awake 5 min for access");
     }
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
-    analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
     loadConfig();
     loadPark();          // NVS is the durable source of truth: RTC memory dies on every brownout
-    Serial.printf("park state from NVS: parked=%u vmin=%u\n", rtcParked, rtcVmin);
-    updatePower();
-    Serial.printf("battery=%u mV -> power %s (threshold %u)\n",
-                  battMv, powerPresent ? "PRESENT" : "ABSENT", cfg.powerThreshMv);
+    battMv = readBatteryMv();
+    Serial.printf("park state from NVS: parked=%u  battery=%u mV\n", rtcParked, battMv);
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     wakeCause = cause == ESP_SLEEP_WAKEUP_EXT0  ? "button"
@@ -1211,7 +1171,7 @@ void setup()
     imuInit();
     // Motion wake: only commit to TRIP if it's sustained. Unconfirmed -> motionActive() stays false,
     // wantTrip() stays false, and we fall into the park block below and go back to sleep.
-    if (cause == ESP_SLEEP_WAKEUP_EXT1 && imuOk && cfg.modeOverride == MODE_AUTO && !powerPresent) {
+    if (cause == ESP_SLEEP_WAKEUP_EXT1 && imuOk && cfg.modeOverride == MODE_AUTO) {
         if (confirmMotion()) {
             markMotion();
             Serial.println("MOTION confirmed -> TRIP");
@@ -1222,19 +1182,13 @@ void setup()
         }
     }
 
-    // ---- Deep-sleep PARK: cheap ignition-check cadence, full GPS report every parkMin ----
-    // On battery with deep-sleep on, wake briefly every checkSec WITHOUT booting the modem,
-    // purely to see if the ignition came on (charging -> powerPresent). If it did, fall
-    // through to the awake/TRIP path below. If not, only run the expensive modem+GPS report
-    // once parkMin of sleep has accumulated. This decouples "catch the ignition" (fast, cheap)
-    // from "log a GPS point" (slow, ~every 45 min) so ignition is caught within ~checkSec
-    // without paying a modem boot every time.
-    if (cfg.deepSleep && !wokeByButton && !wantTrip()) {   // wantTrip(): power-detect OR manual override
-        // A nudge wake interrupts a sleep of unknown length: don't credit it, but don't reset the
-        // accumulator either, or a car that gets knocked often would never reach a command-check.
-        if (cause == ESP_SLEEP_WAKEUP_TIMER) rtcSinceCmd += cfg.checkSec;
-        else if (cause != ESP_SLEEP_WAKEUP_EXT1) rtcSinceCmd = 0;
-
+    // ---- Deep-sleep PARK ----
+    // Three kinds of wake while parked, none of which power the modem unless they have to:
+    //   1. park entry (once): fresh GPS fix -> report the parked position, then sleep.
+    //   2. scheduled check-in (every cmdSec): status-only heartbeat to collect remote commands.
+    //   3. anything else (an unconfirmed motion nudge): straight back to sleep, same schedule.
+    // Confirmed motion never gets here - wantTrip() is true, so it falls through to TRIP below.
+    if (cfg.deepSleep && !wokeByButton && !wantTrip()) {
         if (!rtcParked) {
             // PARK ENTRY (once): fresh GPS fix -> report the parked position to Traccar + HA. After
             // this we do NOT re-report position while parked -- a parked car isn't moving.
@@ -1256,38 +1210,33 @@ void setup()
             else Serial.println("PARK: no fix and no cached position");
             if (cfg.traccarEnabled && (got || rtcFixValid)) { pushTrack(fix.lat, fix.lon); report(); }
             heartbeat();                    // full report (position) -> HA
-            rtcParked = 1; rtcSinceCmd = 0;
+            rtcParked = 1;
             savePark();                     // survive the brownout that RTC memory can't
+            scheduleCheckIn();              // after cacheFix(), which may have synced the clock
             if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
-            else parkSleep(cfg.checkSec, true);
+            else parkSleep(secsToCheckIn(), true);
             // (if staying awake: don't sleep -> fall through to the awake path below)
-        } else if (cfg.cmdSec > 0 && rtcSinceCmd >= (uint32_t)cfg.cmdSec) {
-            // command-check: boot modem + STATUS-ONLY heartbeat (no GPS fix, no position, no Traccar)
-            // just to collect remote commands + refresh battery/status. No wasted position reports.
+        } else if (checkInDue(cause)) {
+            // Status-only check-in: no GPS fix, no position, no Traccar - just an uplink to collect
+            // queued commands and refresh battery. On home WiFi the modem isn't touched at all.
             modeStr = "PARK";
-            // A command-check needs no GPS and reports no position -- just an uplink to collect
-            // queued commands and refresh battery. So if home WiFi is reachable we skip the modem
-            // ENTIRELY: no PWRKEY pulse, no cellular attach, no inrush, no brownout.
             bool wifiUp = joinWiFi(12000);
             if (!wifiUp) {
-                Serial.println("PARK command-check: no WiFi -> modem + register");
+                Serial.println("PARK check-in: no WiFi -> modem + register");
                 bootModem();
                 uint32_t rend = millis() + 45000;
                 while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1500); }
             } else {
-                Serial.println("PARK command-check: over WiFi (modem stays off)");
+                Serial.println("PARK check-in: over WiFi (modem stays off)");
             }
             heartbeat(true);                // status only; picks up any queued command
-            rtcSinceCmd = 0;
-            savePark();
+            scheduleCheckIn();
             if (stayAwake || wantTrip()) Serial.println("PARK: command -> staying awake/TRIP");
-            else parkSleep(cfg.checkSec, true);
+            else parkSleep(secsToCheckIn(), true);
         } else {
-            // cheap ignition-check: no modem booted, straight back to sleep
-            Serial.printf("PARK check: on battery (cmd %us/%us) -> re-sleep %us\n",
-                          rtcSinceCmd, cfg.cmdSec, cfg.checkSec);
-            savePark();                     // persist the accumulated floor before sleeping
-            parkSleep(cfg.checkSec, false); // radios never came up this wake
+            uint32_t s = secsToCheckIn();
+            Serial.printf("PARK: %s wake -> back to sleep (next check-in in %us)\n", wakeCause, s);
+            parkSleep(s, false);            // radios never came up this wake
         }
         // parkSleep does not return
     }
@@ -1329,37 +1278,41 @@ void loop()
         }
     }
 
-    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastPwr = 0, lastLog = 0, lastCell = 0, lastAgps = 0, lastCmdChk = 0;
-    static uint32_t powerLostSince = 0;
+    static uint32_t lastGnss = 0, lastReport = 0, lastTrack = 0, lastMode = 0, lastLog = 0, lastCell = 0, lastAgps = 0, lastCmdChk = 0;
+    static uint32_t stillSince = 0;
 
     if (millis() - lastGnss > 4000) { lastGnss = millis(); pollGnss(); }
     if (millis() - lastCell > 7500) { lastCell = millis(); pollModemStatusStep(); }  // 1 cmd/pass, ~30s full cycle
     // A-GPS: refresh assist data once registered, then every ~2h (needs GNSS off during inject? no - runs alongside)
     if (cfg.agps && cellRegistered && (lastAgps == 0 || millis() - lastAgps > 2UL * 3600 * 1000UL)) { lastAgps = millis(); refreshAGPS(); }
 
-    if (millis() - lastPwr > 5000) {          // re-check power every 5s
-        lastPwr = millis();
-        updatePower();
-        // reset park-entry + charge-baseline; persist it, or a stale NVS floor would outlive the trip
+    if (millis() - lastMode > 5000) {         // re-evaluate TRIP/PARK every 5s
+        lastMode = millis();
+        battMv = readBatteryMv();             // telemetry only
         if (wantTrip()) {
-            modeStr = "TRIP"; powerLostSince = 0;
-            if (rtcParked || rtcVmin) { rtcParked = 0; rtcVmin = 0; savePark(); }
+            modeStr = "TRIP"; stillSince = 0;
+            if (rtcParked) { rtcParked = 0; savePark(); }   // next stop gets a fresh park entry
         }
         else {
-            if (!powerLostSince) powerLostSince = millis();
-            // confirm parked: AUTO waits past the wake window + 60s without power (crank-dip debounce);
-            // a manual PARK override parks promptly.
+            if (!stillSince) stillSince = millis();
+            // confirm parked: AUTO waits past the wake window + 60s after the motion hold ran out
+            // (so a pause just past the hold doesn't park mid-journey); a manual PARK override
+            // parks promptly.
             bool forcePark = (cfg.modeOverride == MODE_PARK);
-            bool ready = forcePark || (millis() > stayAwakeUntil && millis() - powerLostSince > 60000);
+            bool ready = forcePark || (millis() > stayAwakeUntil && millis() - stillSince > 60000);
             if (ready && !rtcParked) {
                 // PARK ENTRY (once): report the parked position to Traccar + HA, then no re-reports
                 if (haveFix() && cfg.traccarEnabled) report();
                 heartbeat();
                 rtcParked = 1;
+                // Persist it: without this the first deep-sleep wake reloaded parked=0 from NVS
+                // and ran a second full park entry (modem + GPS + report).
+                savePark();
+                scheduleCheckIn();
             }
             if (cfg.deepSleep && ready) {
                 Serial.println("PARK -> enter deep-sleep");
-                parkSleep(cfg.checkSec, true);    // entry report done; power down, wake in checkSec
+                parkSleep(secsToCheckIn(), true); // entry report done; power down until check-in/motion
             }
             modeStr = "PARK";              // awake PARK when deep-sleep is off
         }
@@ -1373,16 +1326,16 @@ void loop()
         if (haveFix() && cfg.traccarEnabled) report();   // position -> Traccar (fix only)
         heartbeat();                                     // status -> HA bridge
     }
-    // PARK (awake): collect remote commands more often than the parkMin report -- cheap here
-    // (radios already up), so Force TRIP / Wake land within cmdSec instead of a full park interval.
+    // PARK (awake, deep sleep off): check in every cmdSec -- cheap here (radios already up), so
+    // Force TRIP / Wake land within cmdSec.
     if (!wantTrip() && rtcParked && cfg.cmdSec > 0 && millis() - lastCmdChk > (uint32_t)cfg.cmdSec * 1000UL) {
         lastCmdChk = millis();
         heartbeat(true);                                 // parked status check-in (no position)
     }
     if (millis() - lastLog > 5000) {
         lastLog = millis();
-        Serial.printf("[%s] batt:%umV pwr:%d wifi:%s sats:%d %s\n",
-                      modeStr, battMv, powerPresent, apMode ? "AP" : "STA",
+        Serial.printf("[%s] batt:%umV moving:%d wifi:%s sats:%d %s\n",
+                      modeStr, battMv, motionActive(), apMode ? "AP" : "STA",
                       fix.sats, haveFix() ? "FIX" : "NO-FIX");
     }
 }
