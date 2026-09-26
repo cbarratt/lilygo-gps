@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.13.0"
+#define FW_VERSION "1.13.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -235,7 +235,8 @@ const char* resetReasonStr()
         default:                return "unknown";
     }
 }
-bool fixIsCached = false;                 // true when `fix` was loaded from the RTC cache
+bool fixIsCached = false;
+bool gotFixThisBoot = false;              // a live fix since power-up: A-GPS is no longer useful                 // true when `fix` was loaded from the RTC cache
 #define SIG_MAX 48                        // ~16 min at one sample / 20s
 int8_t    sigHist[SIG_MAX];
 int       sigN = 0, sigHead = 0;
@@ -296,7 +297,7 @@ bool parseCGNSSINFO(const String &resp)
     if (n > 12) fix.speedKn = atof(f[12].c_str());
     if (n > 13) fix.course  = atof(f[13].c_str());
     if (n > 15) fix.hdop    = atof(f[15].c_str());
-    fix.valid = true; fix.ageMs = millis(); fixIsCached = false;
+    fix.valid = true; fix.ageMs = millis(); fixIsCached = false; gotFixThisBoot = true;
     return true;
 }
 String lastGnssRaw = "";
@@ -1283,8 +1284,10 @@ void loop()
 
     if (millis() - lastGnss > 4000) { lastGnss = millis(); pollGnss(); }
     if (millis() - lastCell > 7500) { lastCell = millis(); pollModemStatusStep(); }  // 1 cmd/pass, ~30s full cycle
-    // A-GPS: refresh assist data once registered, then every ~2h (needs GNSS off during inject? no - runs alongside)
-    if (cfg.agps && cellRegistered && (lastAgps == 0 || millis() - lastAgps > 2UL * 3600 * 1000UL)) { lastAgps = millis(); refreshAGPS(); }
+    // A-GPS only speeds up the FIRST fix. Injecting it (AT+CAGPS) once GNSS is tracking restarts the
+    // engine and drops a good fix - seen as 40 sats -> 0 about 40 s into a TRIP, right when the modem
+    // registered. So: only before the first fix of this boot, retried every 10 min while still searching.
+    if (cfg.agps && cellRegistered && !gotFixThisBoot && (lastAgps == 0 || millis() - lastAgps > 10UL * 60 * 1000UL)) { lastAgps = millis(); refreshAGPS(); }
 
     if (millis() - lastMode > 5000) {         // re-evaluate TRIP/PARK every 5s
         lastMode = millis();
