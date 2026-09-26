@@ -24,7 +24,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.12.0"
+#define FW_VERSION "1.12.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -478,6 +478,12 @@ bool motionActive() { return imuOk && motionSeen && millis() - lastMotionMs < MO
 // While awake: every latched event refreshes the TRIP hold. Cheap - one pin read per loop pass.
 void imuPoll()
 {
+    // While movement continues, reading INT1_SRC re-latches immediately, so the pin reads high on
+    // every loop pass. Check at most once per 10 Hz sample: mcount then counts samples, not loop
+    // iterations, and driving doesn't hammer the I2C bus.
+    static uint32_t lastPoll = 0;
+    if (millis() - lastPoll < 100) return;
+    lastPoll = millis();
     if (!imuOk || !digitalRead(IMU_INT_PIN)) return;
     imuClearLatch();
     markMotion();
