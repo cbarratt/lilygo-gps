@@ -101,6 +101,13 @@ You **cannot push** to a deep-sleeping device — it only wakes on its check-in 
 
 WiFi: the config hotspot `TTGO-GPS-Setup` is raised **only while STA is disconnected** (15 s debounce) and dropped when home WiFi returns — so there's no open AP at home, but it's reachable when away.
 
+**Power peaks (battery brownouts).** The modem's current spikes can reset the board on battery (a known T-A7670 issue), so the firmware keeps the peaks apart:
+- **LTE only** (`AT+CNMP=38`): no 2G/GSM fallback, whose ~2 A transmit bursts are the worst offender.
+- **WiFi is switched off while the modem powers up.** In the awake path it waits up to 30 s for the 4G attach before starting WiFi, so a BOOT wake takes that much longer to reach the web UI.
+- **No setup hotspot while in TRIP.** Away from home it's raised only when awake and not driving.
+
+Hardware fix: ~2000 µF low-ESR across the 18650 tabs, plus a high-drain cell.
+
 ---
 
 ## Home Assistant

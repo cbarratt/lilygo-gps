@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.14.0"
+#define FW_VERSION "1.14.1"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -876,7 +876,8 @@ void startNetwork()
     uint32_t end = millis() + 15000;
     while (WiFi.status() != WL_CONNECTED && millis() < end) delay(300);
     if (WiFi.status() == WL_CONNECTED) Serial.printf("WiFi: STA %s\n", WiFi.localIP().toString().c_str());
-    else { setAp(true); Serial.printf("WiFi: STA down -> AP %s\n", WiFi.softAPIP().toString().c_str()); }
+    else if (!wantTrip()) { setAp(true); Serial.printf("WiFi: STA down -> AP %s\n", WiFi.softAPIP().toString().c_str()); }
+    else Serial.println("WiFi: STA down, TRIP -> no hotspot (saves power; uplink is 4G)");
     if (MDNS.begin("ttgo-gps")) Serial.println("mDNS: http://ttgo-gps.local");
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send_P(200, "text/html", PAGE_STATUS); });
     server.on("/config", HTTP_GET, handleConfig);
@@ -910,6 +911,10 @@ bool joinWiFi(uint32_t timeoutMs)
 
 void bootModem()
 {
+    // Never power the modem up while WiFi is transmitting: the two current peaks together are what
+    // brown the board out on battery (both caught `wdt` resets were modem-start with WiFi connected).
+    // Callers that want WiFi bring it back afterwards (startNetwork / loop rejoin).
+    if (WiFi.getMode() != WIFI_OFF) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); apMode = false; delay(100); }
     pinMode(BOARD_POWERON_PIN, OUTPUT); digitalWrite(BOARD_POWERON_PIN, HIGH);
     pinMode(MODEM_RESET_PIN, OUTPUT);
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL); delay(100);
@@ -927,6 +932,9 @@ void bootModem()
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
     delay(4000);
     for (int i = 0; i < 20; i++) if (atCmd("AT", 700).indexOf("OK") >= 0) break; else delay(500);
+    // LTE only: 2G/GSM transmit bursts are the ~2 A peaks that brown the board out on battery;
+    // LTE Cat-1 peaks far lower. UK 2G is being retired anyway, so falling back to it buys little.
+    atCmd("AT+CNMP=38", 1500);
     modemBooted = true;
 }
 void startGNSS()
@@ -1283,6 +1291,12 @@ void setup()
     // was a command-check (modem up, GNSS never powered) -- otherwise TRIP would run without a fix
     if (!modemBooted) bootModem();
     if (!gnssStarted) startGNSS();
+    // Let the modem finish its network attach (a current peak of its own) before WiFi starts
+    // transmitting too. Up to 30 s; startGNSS() above already used some of that time.
+    if (cfg.cellEnabled) {
+        uint32_t rend = millis() + 30000;
+        while (!cellRegistered && millis() < rend) { pollModemStatusStep(); delay(1000); }
+    }
     startNetwork();
     modeStr = wantTrip() ? "TRIP" : "PARK";
     Serial.printf("%s: awake, reporting on interval (deep-sleep %s, override %s)\n",
@@ -1308,7 +1322,10 @@ void loop()
             if (apMode) setAp(false);                        // home WiFi back -> drop hotspot
         } else {
             if (!staDownSince) staDownSince = millis();
-            if (!apMode && millis() - staDownSince > 15000) setAp(true);   // down >15s -> raise it
+            // Away from home the hotspot is only for setup: not while driving (TRIP), where its
+            // beacons add to the modem's current peaks. Raised again once parked-but-awake.
+            if (wantTrip()) { if (apMode) setAp(false); }
+            else if (!apMode && millis() - staDownSince > 15000) setAp(true);   // down >15s -> raise it
             if (cfg.wifiSsid.length() && millis() - lastRejoin > 30000) {  // keep trying to rejoin home
                 lastRejoin = millis(); WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
             }
