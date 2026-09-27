@@ -85,6 +85,11 @@ def publish_discovery(did):
     cfg("sensor", "nudges", {"name": "Motion nudges", "icon": "mdi:hand-back-right",
                              "state_class": "total_increasing",
                              "value_template": "{{ value_json.nudges | default(0) }}"})
+    # Why the chip last started: deepsleep = normal wake; brownout / wdt / panic / taskwdt / intwdt /
+    # poweron = an unplanned reset (sw = reboot/OTA). Stays set for that whole boot, so a change
+    # mid-TRIP is the reset, with its cause.
+    cfg("sensor", "rst",    {"name": "Reset reason", "icon": "mdi:restart-alert",
+                             "value_template": "{{ value_json.rst | default('n/a') }}"})
     # "last reported" = when the bridge last received a heartbeat (published from its own topic)
     mc.publish(f"homeassistant/sensor/{nid}/last_seen/config", json.dumps({
         "unique_id": f"{nid}_last_seen", "device": dev,
