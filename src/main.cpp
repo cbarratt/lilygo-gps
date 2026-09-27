@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.14.2"
+#define FW_VERSION "1.14.3"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -1344,7 +1344,14 @@ void loop()
     // A-GPS only speeds up the FIRST fix. Injecting it (AT+CAGPS) once GNSS is tracking restarts the
     // engine and drops a good fix - seen as 40 sats -> 0 about 40 s into a TRIP, right when the modem
     // registered. So: only before the first fix of this boot, retried every 10 min while still searching.
-    if (cfg.agps && cellRegistered && !gotFixThisBoot && (lastAgps == 0 || millis() - lastAgps > 10UL * 60 * 1000UL)) { lastAgps = millis(); refreshAGPS(); }
+    // An error (usually +CEREG reports registered a few seconds before the data bearer is up) retries
+    // after 30 s instead, a few times.
+    static uint8_t agpsQuickRetries = 0;
+    uint32_t agpsEvery = (agpsStatus == "error" && agpsQuickRetries < 4) ? 30000UL : 10UL * 60 * 1000UL;
+    if (cfg.agps && cellRegistered && !gotFixThisBoot && (lastAgps == 0 || millis() - lastAgps > agpsEvery)) {
+        if (agpsStatus == "error") agpsQuickRetries++;
+        lastAgps = millis(); refreshAGPS();
+    }
 
     if (millis() - lastMode > 5000) {         // re-evaluate TRIP/PARK every 5s
         lastMode = millis();
