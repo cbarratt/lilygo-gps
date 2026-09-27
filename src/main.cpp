@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.14.1"
+#define FW_VERSION "1.14.2"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -547,11 +547,15 @@ void pollModemStatusStep()
         cellRssiDbm = (val == 99 || val == 0) ? 0 : (-113 + 2 * val);
         pushSig(cellRssiDbm ? cellRssiDbm : -113);   // one signal sample per cycle
     } else if (step == 2) {
-        String r = atCmd("AT+CREG?", 600);
-        String creg = afterKey(r, "+CREG:");           // <n>,<stat>: 1=home, 5=roaming
-        int c2 = creg.indexOf(',');
-        int stat = (c2 >= 0) ? creg.substring(c2 + 1).toInt() : 0;
-        cellRegistered = (stat == 1 || stat == 5);
+        // LTE-only (CNMP=38) registers on EPS, reported by +CEREG; +CREG (circuit-switched) can
+        // stay "not registered" on an LTE-only attach, so accept either.
+        auto regStat = [](const String &r, const char *key) {
+            String v = afterKey(r, key);                // <n>,<stat>: 1=home, 5=roaming
+            int c2 = v.indexOf(',');
+            int stat = (c2 >= 0) ? v.substring(c2 + 1).toInt() : 0;
+            return stat == 1 || stat == 5;
+        };
+        cellRegistered = regStat(atCmd("AT+CEREG?", 600), "+CEREG:") || regStat(atCmd("AT+CREG?", 600), "+CREG:");
     } else {
         String r = atCmd("AT+COPS?", 800);
         int q1 = r.indexOf('"'); int q2 = (q1 >= 0) ? r.indexOf('"', q1 + 1) : -1;
