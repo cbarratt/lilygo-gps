@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.13.1"
+#define FW_VERSION "1.14.0"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -214,6 +214,21 @@ void loadPark()
     Preferences p;
     p.begin("park", true);
     rtcParked = p.getUChar("parked", 0);
+    p.end();
+}
+
+// Trip safety net. Powering the modem up on battery can reset the whole chip (brownout -> RTC
+// watchdog), which wipes the in-RAM motion hold: the device would then run a park entry and go
+// to sleep mid-drive. So a motion TRIP is flagged in NVS *before* the modem starts; a reset that
+// finds the flag resumes TRIP. `resumes` counts back-to-back resumes so a reset loop (every modem
+// start browning out) gives up after TRIP_MAX_RESUMES instead of draining the battery.
+#define TRIP_MAX_RESUMES 3
+void saveTrip(bool on)
+{
+    Preferences p;
+    p.begin("park", false);
+    p.putUChar("trip", on ? 1 : 0);
+    if (!on) p.putUChar("resumes", 0);
     p.end();
 }
 
@@ -1175,12 +1190,32 @@ void setup()
     if (cause == ESP_SLEEP_WAKEUP_EXT1 && imuOk && cfg.modeOverride == MODE_AUTO) {
         if (confirmMotion()) {
             markMotion();
+            saveTrip(true);                 // before bootModem(): survive a modem-start brownout
             Serial.println("MOTION confirmed -> TRIP");
         } else {
             wakeCause = "nudge";
             rtcNudges++;
             Serial.printf("motion not sustained (nudge #%u) -> back to park\n", rtcNudges);
         }
+    }
+
+    // Reset (not a sleep wake) while a motion TRIP was in progress -> resume it, don't park.
+    // markMotion() gives a fresh 3-min hold: if the car has actually stopped, it parks normally.
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED && imuOk && cfg.modeOverride == MODE_AUTO) {
+        Preferences p; p.begin("park", false);
+        if (p.getUChar("trip", 0)) {
+            uint8_t n = p.getUChar("resumes", 0) + 1;
+            if (n <= TRIP_MAX_RESUMES) {
+                p.putUChar("resumes", n);
+                markMotion();
+                wakeCause = "resume";
+                Serial.printf("reset (%s) during TRIP -> resuming (%u/%u)\n", resetReasonStr(), n, TRIP_MAX_RESUMES);
+            } else {
+                p.putUChar("trip", 0); p.putUChar("resumes", 0);
+                Serial.println("TRIP resume limit hit (reset loop?) -> parking");
+            }
+        }
+        p.end();
     }
 
     // ---- Deep-sleep PARK ----
@@ -1213,6 +1248,7 @@ void setup()
             heartbeat();                    // full report (position) -> HA
             rtcParked = 1;
             savePark();                     // survive the brownout that RTC memory can't
+            saveTrip(false);
             scheduleCheckIn();              // after cacheFix(), which may have synced the clock
             if (stayAwake || wantTrip()) Serial.println("PARK: staying awake (wake cmd or TRIP override)");
             else parkSleep(secsToCheckIn(), true);
@@ -1294,7 +1330,18 @@ void loop()
         battMv = readBatteryMv();             // telemetry only
         if (wantTrip()) {
             modeStr = "TRIP"; stillSince = 0;
-            if (rtcParked) { rtcParked = 0; savePark(); }   // next stop gets a fresh park entry
+            if (rtcParked) {                                // next stop gets a fresh park entry
+                rtcParked = 0; savePark();
+                if (cfg.modeOverride == MODE_AUTO) saveTrip(true);
+            }
+            // Survived 2 min in TRIP -> the modem is up and stable; forget earlier resumes.
+            static bool resumesCleared = false;
+            if (!resumesCleared && millis() > 120000UL) {
+                resumesCleared = true;
+                Preferences p; p.begin("park", false);
+                if (p.getUChar("resumes", 0)) p.putUChar("resumes", 0);
+                p.end();
+            }
         }
         else {
             if (!stillSince) stillSince = millis();
@@ -1311,6 +1358,7 @@ void loop()
                 // Persist it: without this the first deep-sleep wake reloaded parked=0 from NVS
                 // and ran a second full park entry (modem + GPS + report).
                 savePark();
+                saveTrip(false);
                 scheduleCheckIn();
             }
             if (cfg.deepSleep && ready) {
