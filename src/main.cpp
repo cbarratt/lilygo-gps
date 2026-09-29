@@ -25,7 +25,7 @@
 #include <math.h>
 #include <sys/time.h>
 
-#define FW_VERSION "1.14.3"
+#define FW_VERSION "1.14.4"
 
 // manual mode override (beats the power heuristic when you know what you want)
 #define MODE_AUTO 0   // power-detect decides TRIP vs PARK
@@ -913,6 +913,18 @@ bool joinWiFi(uint32_t timeoutMs)
     return up;
 }
 
+// APN + PDP auth for context 1. Set before the LTE attach, since the attach brings up the default
+// bearer on this APN. SIMCom order is AT+CGAUTH=<cid>,<type>,<passwd>,<user> (password FIRST);
+// type 1 = PAP, 0 = none (clears credentials left by a previous SIM).
+void applyApn()
+{
+    atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000);
+    if (cfg.apnUser.length() || cfg.apnPass.length())
+        atCmd(("AT+CGAUTH=1,1,\"" + cfg.apnPass + "\",\"" + cfg.apnUser + "\"").c_str(), 1000);
+    else
+        atCmd("AT+CGAUTH=1,0", 1000);
+}
+
 void bootModem()
 {
     // Never power the modem up while WiFi is transmitting: the two current peaks together are what
@@ -939,6 +951,7 @@ void bootModem()
     // LTE only: 2G/GSM transmit bursts are the ~2 A peaks that brown the board out on battery;
     // LTE Cat-1 peaks far lower. UK 2G is being retired anyway, so falling back to it buys little.
     atCmd("AT+CNMP=38", 1500);
+    applyApn();                         // before registration: LTE attach uses the cid 1 APN
     modemBooted = true;
 }
 void startGNSS()
@@ -1013,7 +1026,7 @@ void refreshAGPS()
 {
     if (!cfg.agps)       { agpsStatus = "off"; return; }
     if (!cellRegistered) { agpsStatus = "no network"; return; }   // assist data comes over cellular
-    atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000);
+    applyApn();
     atCmd("AT+CGACT=1,1", 6000);                                  // ensure a data context for the download
     String u = atCmd("AT+CAGPS", 3000);                           // request assist data from the AGNSS server
     agpsStatus = (u.indexOf("ERROR") >= 0) ? "error" : "requested";
@@ -1036,7 +1049,7 @@ void report()
 // POST a JSON body over 4G via the A7670 HTTP stack; returns the response body.
 String modemHttpPost(const String &url, const String &body)
 {
-    atCmd(("AT+CGDCONT=1,\"IP\",\"" + cfg.apn + "\"").c_str(), 1000);
+    applyApn();
     atCmd("AT+CGACT=1,1", 6000);
     atCmd("AT+HTTPTERM", 400);
     atCmd("AT+HTTPINIT", 3000);
